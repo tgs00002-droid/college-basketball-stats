@@ -202,10 +202,11 @@ def parse_shots_from_pbp(pbp_json: Dict[str, Any]) -> pd.DataFrame:
         text = (p.get("text") or "").strip()
         if not text or not is_shot_play(text):
             continue
+low = f" {text.lower()} "
 
-        low = f" {text.lower()} "
-        made = " made " in low
-        missed = " missed " in low
+made = any(k in low for k in [" made ", " makes "])
+missed = any(k in low for k in [" missed ", " misses "])
+
         if not (made or missed):
             continue
 
