@@ -17,6 +17,7 @@ except Exception:
 # -----------------------------
 USER_AGENT = "Mozilla/5.0"
 CACHE_TTL_SECONDS = 300
+
 DEFAULT_GAME_URL = "https://www.espn.com/mens-college-basketball/playbyplay/_/gameId/401817514"
 DEFAULT_ROSTER_TEAM_ID = "120"  # Maryland
 DEFAULT_ROSTER_TEAM_NAME = "Maryland Terrapins"
@@ -35,9 +36,14 @@ def extract_game_id(url_or_id: str) -> str:
     raise ValueError("Could not find gameId. Paste an ESPN URL with /gameId/######### or just the numeric id.")
 
 
-def safe_get_json(url: str) -> Dict[str, Any]:
+def safe_get(url: str) -> requests.Response:
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
     r.raise_for_status()
+    return r
+
+
+def safe_get_json(url: str) -> Dict[str, Any]:
+    r = safe_get(url)
     return r.json()
 
 
@@ -59,6 +65,18 @@ def fetch_team_roster(team_id: str) -> Dict[str, Any]:
     )
 
 
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
+def fetch_pbp_html_tables(game_id: str) -> List[pd.DataFrame]:
+    """
+    Fallback: scrape ESPN play-by-play webpage tables when JSON API returns 0 plays.
+    """
+    url = f"https://www.espn.com/mens-college-basketball/playbyplay/_/gameId/{game_id}"
+    html = safe_get(url).text
+    # ESPN has multiple tables (often one per half/OT)
+    tables = pd.read_html(html)
+    return tables
+
+
 # -----------------------------
 # Parsing helpers
 # -----------------------------
@@ -69,27 +87,6 @@ def normalize_name(name: str) -> str:
     name = re.sub(r"[^a-z\s\-']", "", name)
     name = re.sub(r"\s+", " ", name)
     return name
-
-
-def extract_all_plays(pbp_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-    plays: List[Dict[str, Any]] = []
-
-    if isinstance(pbp_json.get("plays"), list):
-        plays.extend(pbp_json["plays"])
-
-    drives = pbp_json.get("drives", [])
-    if isinstance(drives, list):
-        for d in drives:
-            if isinstance(d, dict) and isinstance(d.get("plays"), list):
-                plays.extend(d["plays"])
-
-    periods = pbp_json.get("periods", [])
-    if isinstance(periods, list):
-        for prd in periods:
-            if isinstance(prd, dict) and isinstance(prd.get("plays"), list):
-                plays.extend(prd["plays"])
-
-    return plays
 
 
 def parse_result(text: str) -> str:
@@ -201,11 +198,32 @@ def infer_zone(text: str) -> str:
     return "Other"
 
 
-def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
+def extract_all_plays(pbp_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    plays: List[Dict[str, Any]] = []
+
+    if isinstance(pbp_json.get("plays"), list):
+        plays.extend(pbp_json["plays"])
+
+    drives = pbp_json.get("drives", [])
+    if isinstance(drives, list):
+        for d in drives:
+            if isinstance(d, dict) and isinstance(d.get("plays"), list):
+                plays.extend(d["plays"])
+
+    periods = pbp_json.get("periods", [])
+    if isinstance(periods, list):
+        for prd in periods:
+            if isinstance(prd, dict) and isinstance(prd.get("plays"), list):
+                plays.extend(prd["plays"])
+
+    return plays
+
+
+def parse_shots_from_api(pbp_json: Dict[str, Any]) -> pd.DataFrame:
     schema = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
     plays = extract_all_plays(pbp_json)
-    rows = []
 
+    rows = []
     for p in plays:
         if not isinstance(p, dict):
             continue
@@ -215,7 +233,7 @@ def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
             continue
 
         result = parse_result(text)
-        if result == "":
+        if not result:
             continue
 
         team = None
@@ -236,29 +254,141 @@ def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
         pts = val if result == "Made" else 0
 
         rows.append(
-            {
-                "team": team,
-                "period": period,
-                "clock": clock,
-                "shooter": shooter,
-                "result": result,
-                "zone": zone,
-                "shot_value": val,
-                "pts": pts,
-                "description": text,
-            }
+            dict(
+                team=team, period=period, clock=clock, shooter=shooter, result=result,
+                zone=zone, shot_value=val, pts=pts, description=text
+            )
         )
 
     df = pd.DataFrame(rows)
-    # enforce schema even if empty (prevents KeyErrors everywhere)
     for c in schema:
         if c not in df.columns:
             df[c] = pd.Series(dtype="object")
     return df[schema]
 
 
+def teams_from_summary(summary_json: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Returns (away_name, home_name)
+    """
+    away = ""
+    home = ""
+    comps = summary_json.get("header", {}).get("competitions", [])
+    if comps:
+        competitors = comps[0].get("competitors", []) or []
+        # usually: 0 away, 1 home but we won't assume order
+        for c in competitors:
+            team = c.get("team") or {}
+            name = team.get("displayName") or ""
+            ha = (c.get("homeAway") or "").lower()
+            if ha == "away":
+                away = name
+            elif ha == "home":
+                home = name
+    return away, home
+
+
+def parse_shots_from_html_tables(summary_json: Dict[str, Any], tables: List[pd.DataFrame]) -> pd.DataFrame:
+    """
+    ESPN HTML pbp tables typically have:
+      - a time column
+      - one column for away text
+      - one column for home text
+    We'll detect those dynamically.
+    """
+    schema = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
+
+    away_name, home_name = teams_from_summary(summary_json)
+
+    rows = []
+    period_guess = 1
+
+    for t in tables:
+        if t is None or t.empty:
+            continue
+
+        # Normalize column names
+        cols = [str(c).strip().lower() for c in t.columns]
+        df = t.copy()
+        df.columns = cols
+
+        # Find a likely clock column
+        clock_col = None
+        for c in cols:
+            if "time" in c or "clock" in c:
+                clock_col = c
+                break
+        if clock_col is None:
+            # sometimes the first column is time
+            clock_col = cols[0]
+
+        # Find away/home text columns:
+        # (usually two text columns besides the clock)
+        text_cols = [c for c in cols if c != clock_col]
+        if len(text_cols) < 2:
+            # not a pbp table
+            continue
+
+        away_col = text_cols[0]
+        home_col = text_cols[1]
+
+        for _, r in df.iterrows():
+            clock = r.get(clock_col, None)
+
+            away_txt = r.get(away_col, None)
+            home_txt = r.get(home_col, None)
+
+            # pick whichever side has text
+            team = None
+            text = None
+
+            if isinstance(away_txt, str) and away_txt.strip():
+                team = away_name or "Away"
+                text = away_txt.strip()
+            elif isinstance(home_txt, str) and home_txt.strip():
+                team = home_name or "Home"
+                text = home_txt.strip()
+
+            if not text:
+                continue
+
+            if not is_shot(text):
+                continue
+
+            result = parse_result(text)
+            if not result:
+                continue
+
+            shooter = parse_shooter(text)
+            val = shot_value(text)
+            zone = infer_zone(text)
+            pts = val if result == "Made" else 0
+
+            rows.append(
+                dict(
+                    team=team,
+                    period=period_guess,  # HTML tables don't always label the period cleanly; this is a usable proxy
+                    clock=clock,
+                    shooter=shooter,
+                    result=result,
+                    zone=zone,
+                    shot_value=val,
+                    pts=pts,
+                    description=text,
+                )
+            )
+
+        period_guess += 1
+
+    df_out = pd.DataFrame(rows)
+    for c in schema:
+        if c not in df_out.columns:
+            df_out[c] = pd.Series(dtype="object")
+    return df_out[schema]
+
+
 # -----------------------------
-# Headshots (Roster-based, always available)
+# Roster headshots lookup
 # -----------------------------
 def build_roster_headshots(team_id: str, team_name: str) -> pd.DataFrame:
     roster_json = fetch_team_roster(team_id)
@@ -269,13 +399,13 @@ def build_roster_headshots(team_id: str, team_name: str) -> pd.DataFrame:
         if name and aid:
             rows.append(
                 {
-                    "team": team_name,
                     "player": name,
                     "player_norm": normalize_name(name),
                     "headshot_url": f"https://a.espncdn.com/i/headshots/mens-college-basketball/players/full/{aid}.png",
                 }
             )
-    return pd.DataFrame(rows).drop_duplicates(subset=["player_norm"])
+    df = pd.DataFrame(rows).drop_duplicates(subset=["player_norm"])
+    return df
 
 
 def attach_headshots(shots: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
@@ -364,14 +494,10 @@ def fg_band_color(v: float) -> str:
 
 def style_zone_table(df: pd.DataFrame):
     show = df.copy()
-
     if "FG%" in show.columns:
-        # SAFETY: force numeric even if dtype is object
         show["FG%"] = pd.to_numeric(show["FG%"], errors="coerce").fillna(0.0).round(3)
-
     if "PTS/shot" in show.columns:
         show["PTS/shot"] = pd.to_numeric(show["PTS/shot"], errors="coerce").fillna(0.0).round(2)
-
     if "Shot Share" in show.columns:
         ss = pd.to_numeric(show["Shot Share"], errors="coerce").fillna(0.0)
         show["Shot Share"] = (ss * 100).round(0).astype(int).astype(str) + "%"
@@ -424,76 +550,77 @@ with st.sidebar:
     if refresh:
         fetch_game_data.clear()
         fetch_team_roster.clear()
+        fetch_pbp_html_tables.clear()
 
-# Load game data
 game_id = extract_game_id(game_input)
-data = fetch_game_data(game_id)
 
+data = fetch_game_data(game_id)
 summary_json = data["summary"]
 pbp_json = data["pbp"]
 
 plays_found = len(extract_all_plays(pbp_json))
-shots = parse_shots(pbp_json)
 
-st.caption(f"Game ID: {game_id} | Plays found: {plays_found} | Shots parsed: {len(shots)}")
+# parse from API first
+shots_api = parse_shots_from_api(pbp_json)
 
-# Always build roster lookup so the app still "works" even if ESPN gives 0 plays
+# if API is empty, scrape HTML tables
+shots = shots_api
+source_used = "ESPN JSON API"
+if plays_found == 0 or len(shots_api) == 0:
+    try:
+        tables = fetch_pbp_html_tables(game_id)
+        shots_html = parse_shots_from_html_tables(summary_json, tables)
+        if len(shots_html) > 0:
+            shots = shots_html
+            source_used = "ESPN HTML (pandas.read_html fallback)"
+    except Exception:
+        pass
+
+# roster lookup always available
 roster_lookup = build_roster_headshots(roster_team_id.strip(), roster_team_name.strip())
 
-# If shots exist, attach headshots
+st.caption(
+    f"Game ID: {game_id} | API plays found: {plays_found} | Shots parsed: {len(shots)} | Source: {source_used}"
+)
+
+# attach headshots if shots exist
 if len(shots) > 0:
     shots = attach_headshots(shots, roster_lookup)
 
-teams = sorted([t for t in shots["team"].dropna().unique().tolist()]) if len(shots) else []
+# if STILL no shots, show roster grid and stop
+if len(shots) == 0:
+    st.warning(
+        "Could not parse shots from ESPN API or HTML tables for this game. "
+        "Showing roster headshots so the app still looks good."
+    )
 
+    st.subheader(f"{roster_team_name} — Roster Headshots")
+    roster_show = roster_lookup.sort_values("player")
+
+    cols = st.columns(6)
+    for i, (_, r) in enumerate(roster_show.iterrows()):
+        with cols[i % 6]:
+            st.image(r["headshot_url"], width=95)
+            st.caption(r["player"])
+    st.stop()
+
+teams = sorted([t for t in shots["team"].dropna().unique().tolist()])
 with st.sidebar:
     team_choice = st.selectbox("Choose a team:", options=["All"] + teams, index=0)
 
 shots_team = shots.copy()
-if len(shots) and team_choice != "All":
+if team_choice != "All":
     shots_team = shots_team[shots_team["team"] == team_choice]
 
-players = sorted([p for p in shots_team["shooter"].dropna().unique().tolist()]) if len(shots_team) else []
-
+players = sorted([p for p in shots_team["shooter"].dropna().unique().tolist()])
 with st.sidebar:
-    player_choice = st.selectbox(
-        "Choose a player:",
-        options=players if players else ["No options to select"],
-        index=0,
-    )
-
-# If no plays from ESPN, show roster-only view (no crashing)
-if plays_found == 0 or len(shots) == 0:
-    st.warning(
-        "ESPN returned 0 play-by-play plays for this event endpoint. "
-        "The app is showing the roster headshots (so your project still looks good). "
-        "Try another gameId that returns plays, or click Refresh."
-    )
-
-    st.subheader(f"{roster_team_name} — Roster Headshots")
-    roster_show = roster_lookup.copy()
-    roster_show = roster_show.sort_values("player")
-
-    # grid display
-    cols = st.columns(6)
-    for i, (_, r) in enumerate(roster_show.iterrows()):
-        with cols[i % 6]:
-            if isinstance(r["headshot_url"], str):
-                st.image(r["headshot_url"], width=95)
-            st.caption(r["player"])
-
-    st.stop()
-
-# Normal view (shots exist)
-if player_choice == "No options to select":
-    st.info("Select a team with players to view the shooting profile.")
-    st.stop()
+    player_choice = st.selectbox("Choose a player:", options=players, index=0 if players else 0)
 
 shots_player = shots_team[shots_team["shooter"] == player_choice].copy()
 
+# Header
 left, right = st.columns([1.5, 8.5])
 with left:
-    hs = None
     vals = shots_player["headshot_url"].dropna().unique().tolist() if "headshot_url" in shots_player.columns else []
     hs = vals[0] if vals else None
     if isinstance(hs, str) and hs.startswith("http"):
@@ -520,4 +647,4 @@ with tab2:
         show_cols.append("headshot_url")
     st.dataframe(shots_team[show_cols], use_container_width=True, hide_index=True)
 
-st.caption("Auto-updates every 5 min (or press Refresh). ESPN play-by-play is text-based; zones are inferred from descriptions.")
+st.caption("Auto-updates every 5 min (or press Refresh). Zones are inferred from descriptions.")
