@@ -127,13 +127,18 @@ def classify_zone(text: str) -> str:
 
 def is_shot_play(text: str) -> bool:
     t = (text or "").lower()
-    if not any(k in t for k in ["made", "missed"]):
+
+    # must contain a make/miss verb
+    if not any(k in t for k in ["made", "missed", "makes", "misses"]):
         return False
+
+    # must contain a shot type
     return any(
         k in t
         for k in [
             "jumper",
             "three point",
+            "three-point",
             "layup",
             "dunk",
             "free throw",
@@ -142,7 +147,6 @@ def is_shot_play(text: str) -> bool:
             "putback",
         ]
     )
-
 
 def get_game_header(summary_json: Dict[str, Any]) -> Tuple[str, str]:
     try:
