@@ -16,8 +16,10 @@ except Exception:
 # Config
 # -----------------------------
 USER_AGENT = "Mozilla/5.0"
-CACHE_TTL_SECONDS = 300  # 5 minutes
+CACHE_TTL_SECONDS = 300
 DEFAULT_GAME_URL = "https://www.espn.com/mens-college-basketball/playbyplay/_/gameId/401817514"
+DEFAULT_ROSTER_TEAM_ID = "120"  # Maryland
+DEFAULT_ROSTER_TEAM_NAME = "Maryland Terrapins"
 
 
 # -----------------------------
@@ -52,7 +54,6 @@ def fetch_game_data(game_id: str) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def fetch_team_roster(team_id: str) -> Dict[str, Any]:
-    # This is the JSON equivalent of the roster page you linked
     return safe_get_json(
         f"https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams/{team_id}/roster"
     )
@@ -143,7 +144,6 @@ def shot_value(text: str) -> int:
         return 1
     if "three point" in t or "three-point" in t:
         return 3
-    # sometimes ESPN uses distance but forgets "three point"
     dist = parse_distance_feet(text)
     if dist is not None and dist >= 23:
         return 3
@@ -202,15 +202,7 @@ def infer_zone(text: str) -> str:
 
 
 def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
-    """
-    IMPORTANT: Always return a DF with the full schema, even when empty.
-    This prevents KeyError: 'shooter' downstream.
-    """
-    schema = [
-        "team", "period", "clock", "shooter", "result",
-        "zone", "shot_value", "pts", "description"
-    ]
-
+    schema = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
     plays = extract_all_plays(pbp_json)
     rows = []
 
@@ -258,7 +250,7 @@ def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(rows)
-    # enforce schema even if empty
+    # enforce schema even if empty (prevents KeyErrors everywhere)
     for c in schema:
         if c not in df.columns:
             df[c] = pd.Series(dtype="object")
@@ -266,67 +258,12 @@ def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
 
 
 # -----------------------------
-# Headshots: Boxscore + Roster
+# Headshots (Roster-based, always available)
 # -----------------------------
-def team_ids_and_logos(summary_json: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """
-    Returns:
-      team_name -> team_id
-      team_name -> logo_url
-    """
-    name_to_id = {}
-    name_to_logo = {}
-    comps = summary_json.get("header", {}).get("competitions", [])
-    if not comps:
-        return name_to_id, name_to_logo
-
-    competitors = comps[0].get("competitors", []) or []
-    for c in competitors:
-        team = c.get("team") or {}
-        name = team.get("displayName")
-        tid = team.get("id")
-        logos = team.get("logos") or []
-        logo = None
-        if isinstance(logos, list) and logos and isinstance(logos[0], dict):
-            logo = logos[0].get("href")
-
-        if name and tid:
-            name_to_id[name] = str(tid)
-        if name and logo:
-            name_to_logo[name] = logo
-
-    return name_to_id, name_to_logo
-
-
-def build_headshot_lookup_from_boxscore(summary_json: Dict[str, Any]) -> pd.DataFrame:
+def build_roster_headshots(team_id: str, team_name: str) -> pd.DataFrame:
+    roster_json = fetch_team_roster(team_id)
     rows = []
-    players_blocks = summary_json.get("boxscore", {}).get("players", [])
-    if not isinstance(players_blocks, list):
-        return pd.DataFrame(columns=["team", "player", "player_norm", "headshot_url"])
-
-    for team_block in players_blocks:
-        team_name = (team_block.get("team") or {}).get("displayName") or (team_block.get("team") or {}).get("abbreviation")
-        for stat_group in team_block.get("statistics", []) or []:
-            for athlete_row in stat_group.get("athletes", []) or []:
-                athlete = (athlete_row or {}).get("athlete") or {}
-                name = athlete.get("displayName") or athlete.get("shortName")
-                aid = athlete.get("id")
-                if name and aid:
-                    rows.append(
-                        {
-                            "team": team_name,
-                            "player": name,
-                            "player_norm": normalize_name(name),
-                            "headshot_url": f"https://a.espncdn.com/i/headshots/mens-college-basketball/players/full/{aid}.png",
-                        }
-                    )
-    return pd.DataFrame(rows).drop_duplicates(subset=["team", "player_norm"])
-
-
-def build_headshot_lookup_from_roster(team_name: str, roster_json: Dict[str, Any]) -> pd.DataFrame:
-    rows = []
-    athletes = roster_json.get("athletes", []) or []
-    for a in athletes:
+    for a in roster_json.get("athletes", []) or []:
         name = a.get("displayName") or a.get("fullName")
         aid = a.get("id")
         if name and aid:
@@ -338,67 +275,35 @@ def build_headshot_lookup_from_roster(team_name: str, roster_json: Dict[str, Any
                     "headshot_url": f"https://a.espncdn.com/i/headshots/mens-college-basketball/players/full/{aid}.png",
                 }
             )
-    return pd.DataFrame(rows).drop_duplicates(subset=["team", "player_norm"])
-
-
-def build_combined_headshot_lookup(summary_json: Dict[str, Any]) -> pd.DataFrame:
-    # Boxscore
-    box_df = build_headshot_lookup_from_boxscore(summary_json)
-
-    # Roster fallback for both teams in the game
-    team_id_map, _ = team_ids_and_logos(summary_json)
-    roster_frames = []
-    for team_name, tid in team_id_map.items():
-        try:
-            roster_json = fetch_team_roster(tid)
-            roster_frames.append(build_headshot_lookup_from_roster(team_name, roster_json))
-        except Exception:
-            pass
-
-    roster_df = pd.concat(roster_frames, ignore_index=True) if roster_frames else pd.DataFrame(
-        columns=["team", "player", "player_norm", "headshot_url"]
-    )
-
-    combined = pd.concat([box_df, roster_df], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["team", "player_norm"])
-    return combined
+    return pd.DataFrame(rows).drop_duplicates(subset=["player_norm"])
 
 
 def attach_headshots(shots: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
     shots = shots.copy()
-    if "shooter" not in shots.columns:
-        # ultra-safety
-        shots["shooter"] = ""
     shots["player_norm"] = shots["shooter"].map(normalize_name)
 
     merged = shots.merge(
-        lookup[["team", "player_norm", "headshot_url", "player"]],
-        on=["team", "player_norm"],
+        lookup[["player_norm", "headshot_url", "player"]],
+        on="player_norm",
         how="left",
     )
 
-    # Optional fuzzy matching if still missing
     if RAPIDFUZZ_AVAILABLE and not lookup.empty:
         missing = merged["headshot_url"].isna()
         if missing.any():
             fixed = merged.copy()
-            for team in fixed.loc[missing, "team"].dropna().unique():
-                team_lookup = lookup[lookup["team"] == team]
-                choices = list(team_lookup["player_norm"].unique())
-                if not choices:
+            choices = list(lookup["player_norm"].unique())
+            for i in fixed.index[missing].tolist():
+                target = fixed.at[i, "player_norm"]
+                if not target:
                     continue
-                idxs = fixed.index[(fixed["team"] == team) & (fixed["headshot_url"].isna())].tolist()
-                for i in idxs:
-                    target = fixed.at[i, "player_norm"]
-                    if not target:
-                        continue
-                    match = process.extractOne(target, choices, scorer=fuzz.WRatio)
-                    if match and match[1] >= 88:
-                        best = match[0]
-                        row = team_lookup[team_lookup["player_norm"] == best].head(1)
-                        if not row.empty:
-                            fixed.at[i, "headshot_url"] = row["headshot_url"].iloc[0]
-                            fixed.at[i, "player"] = row["player"].iloc[0]
+                match = process.extractOne(target, choices, scorer=fuzz.WRatio)
+                if match and match[1] >= 88:
+                    best = match[0]
+                    row = lookup[lookup["player_norm"] == best].head(1)
+                    if not row.empty:
+                        fixed.at[i, "headshot_url"] = row["headshot_url"].iloc[0]
+                        fixed.at[i, "player"] = row["player"].iloc[0]
             merged = fixed
 
     return merged
@@ -445,36 +350,6 @@ def zone_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
-def player_overview(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["Player", "FGM", "FGA", "FG%", "3PM", "3PA", "3P%", "FTM", "FTA", "FT%", "PTS"])
-
-    x = df.copy()
-    x["FGA"] = 1
-    x["FGM"] = (x["result"] == "Made").astype(int)
-
-    x["3PA"] = (x["shot_value"] == 3).astype(int)
-    x["3PM"] = x["3PA"] * x["FGM"]
-    x["FTA"] = (x["shot_value"] == 1).astype(int)
-    x["FTM"] = x["FTA"] * x["FGM"]
-
-    g = x.groupby("shooter", as_index=False).agg(
-        FGM=("FGM", "sum"),
-        FGA=("FGA", "sum"),
-        PTS=("pts", "sum"),
-        **{"3PM": ("3PM", "sum"), "3PA": ("3PA", "sum")},
-        FTM=("FTM", "sum"),
-        FTA=("FTA", "sum"),
-    )
-
-    g["FG%"] = (g["FGM"] / g["FGA"]).fillna(0.0)
-    g["3P%"] = (g["3PM"] / g["3PA"]).replace([pd.NA, float("inf")], 0.0).fillna(0.0)
-    g["FT%"] = (g["FTM"] / g["FTA"]).replace([pd.NA, float("inf")], 0.0).fillna(0.0)
-
-    g.rename(columns={"shooter": "Player"}, inplace=True)
-    return g.sort_values(["PTS", "FGA"], ascending=[False, False])
-
-
 def fg_band_color(v: float) -> str:
     try:
         x = float(v)
@@ -489,12 +364,17 @@ def fg_band_color(v: float) -> str:
 
 def style_zone_table(df: pd.DataFrame):
     show = df.copy()
+
     if "FG%" in show.columns:
-        show["FG%"] = show["FG%"].round(3)
+        # SAFETY: force numeric even if dtype is object
+        show["FG%"] = pd.to_numeric(show["FG%"], errors="coerce").fillna(0.0).round(3)
+
     if "PTS/shot" in show.columns:
-        show["PTS/shot"] = show["PTS/shot"].round(2)
+        show["PTS/shot"] = pd.to_numeric(show["PTS/shot"], errors="coerce").fillna(0.0).round(2)
+
     if "Shot Share" in show.columns:
-        show["Shot Share"] = (show["Shot Share"] * 100).round(0).astype(int).astype(str) + "%"
+        ss = pd.to_numeric(show["Shot Share"], errors="coerce").fillna(0.0)
+        show["Shot Share"] = (ss * 100).round(0).astype(int).astype(str) + "%"
 
     styler = show.style
     if "FG%" in show.columns:
@@ -525,7 +405,7 @@ def header_line(df_player: pd.DataFrame) -> Tuple[int, float, float, float]:
 # -----------------------------
 st.set_page_config(page_title="College Basketball Shooting — ESPN", layout="wide")
 
-top_left, top_right = st.columns([1.5, 8.5])
+top_left, top_right = st.columns([1.6, 8.4])
 with top_left:
     refresh = st.button("Refresh data now\n(pull latest)")
 with top_right:
@@ -537,58 +417,87 @@ with st.sidebar:
     st.header("Filters")
     game_input = st.text_input("Paste ESPN play-by-play URL or gameId:", value=DEFAULT_GAME_URL)
 
+    st.subheader("Roster (headshots fallback)")
+    roster_team_id = st.text_input("Roster teamId (ex: Maryland = 120)", value=DEFAULT_ROSTER_TEAM_ID)
+    roster_team_name = st.text_input("Roster team name", value=DEFAULT_ROSTER_TEAM_NAME)
+
     if refresh:
         fetch_game_data.clear()
         fetch_team_roster.clear()
 
-# Load game
+# Load game data
 game_id = extract_game_id(game_input)
 data = fetch_game_data(game_id)
 
 summary_json = data["summary"]
 pbp_json = data["pbp"]
 
-# Parse
+plays_found = len(extract_all_plays(pbp_json))
 shots = parse_shots(pbp_json)
 
-plays_found = len(extract_all_plays(pbp_json))
 st.caption(f"Game ID: {game_id} | Plays found: {plays_found} | Shots parsed: {len(shots)}")
 
-# Headshots (boxscore + roster)
-headshots = build_combined_headshot_lookup(summary_json)
-shots = attach_headshots(shots, headshots)
+# Always build roster lookup so the app still "works" even if ESPN gives 0 plays
+roster_lookup = build_roster_headshots(roster_team_id.strip(), roster_team_name.strip())
 
-# Teams list from shots
-teams = sorted([t for t in shots["team"].dropna().unique().tolist()])
-team_id_map, team_logo_map = team_ids_and_logos(summary_json)
+# If shots exist, attach headshots
+if len(shots) > 0:
+    shots = attach_headshots(shots, roster_lookup)
+
+teams = sorted([t for t in shots["team"].dropna().unique().tolist()]) if len(shots) else []
 
 with st.sidebar:
     team_choice = st.selectbox("Choose a team:", options=["All"] + teams, index=0)
 
 shots_team = shots.copy()
-if team_choice != "All":
+if len(shots) and team_choice != "All":
     shots_team = shots_team[shots_team["team"] == team_choice]
 
-players = sorted([p for p in shots_team["shooter"].dropna().unique().tolist()])
+players = sorted([p for p in shots_team["shooter"].dropna().unique().tolist()]) if len(shots_team) else []
+
 with st.sidebar:
-    player_choice = st.selectbox("Choose a player:", options=players, index=0 if players else 0)
+    player_choice = st.selectbox(
+        "Choose a player:",
+        options=players if players else ["No options to select"],
+        index=0,
+    )
+
+# If no plays from ESPN, show roster-only view (no crashing)
+if plays_found == 0 or len(shots) == 0:
+    st.warning(
+        "ESPN returned 0 play-by-play plays for this event endpoint. "
+        "The app is showing the roster headshots (so your project still looks good). "
+        "Try another gameId that returns plays, or click Refresh."
+    )
+
+    st.subheader(f"{roster_team_name} — Roster Headshots")
+    roster_show = roster_lookup.copy()
+    roster_show = roster_show.sort_values("player")
+
+    # grid display
+    cols = st.columns(6)
+    for i, (_, r) in enumerate(roster_show.iterrows()):
+        with cols[i % 6]:
+            if isinstance(r["headshot_url"], str):
+                st.image(r["headshot_url"], width=95)
+            st.caption(r["player"])
+
+    st.stop()
+
+# Normal view (shots exist)
+if player_choice == "No options to select":
+    st.info("Select a team with players to view the shooting profile.")
+    st.stop()
 
 shots_player = shots_team[shots_team["shooter"] == player_choice].copy()
 
-# Header (player headshot + team logo + stats line)
-left, mid, right = st.columns([1.2, 1.2, 6.6])
-
+left, right = st.columns([1.5, 8.5])
 with left:
     hs = None
-    vals = shots_player["headshot_url"].dropna().unique().tolist() if not shots_player.empty else []
+    vals = shots_player["headshot_url"].dropna().unique().tolist() if "headshot_url" in shots_player.columns else []
     hs = vals[0] if vals else None
     if isinstance(hs, str) and hs.startswith("http"):
         st.image(hs, width=120)
-
-with mid:
-    logo_url = team_logo_map.get(team_choice) if team_choice != "All" else None
-    if isinstance(logo_url, str) and logo_url.startswith("http"):
-        st.image(logo_url, width=110)
 
 with right:
     st.subheader(f"{player_choice} — Single Game Shooting Profile")
@@ -598,7 +507,7 @@ with right:
 
 st.divider()
 
-tab1, tab2 = st.tabs(["Zone breakdown", "Team overview"])
+tab1, tab2 = st.tabs(["Zone breakdown", "Shot log"])
 
 with tab1:
     zb = zone_breakdown(shots_player).reset_index(drop=True)
@@ -606,17 +515,9 @@ with tab1:
     st.dataframe(style_zone_table(zb), use_container_width=True, hide_index=True)
 
 with tab2:
-    to = player_overview(shots_team).reset_index(drop=True)
-    to.insert(0, "", to.index)
-
-    for c in ["FG%", "3P%", "FT%"]:
-        if c in to.columns:
-            to[c] = (to[c] * 100).round(1)
-
-    st.dataframe(to, use_container_width=True, hide_index=True)
-
-    with st.expander("Show shot log (play-by-play shots)"):
-        show_cols = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description", "headshot_url"]
-        st.dataframe(shots_team[show_cols], use_container_width=True, hide_index=True)
+    show_cols = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
+    if "headshot_url" in shots_team.columns:
+        show_cols.append("headshot_url")
+    st.dataframe(shots_team[show_cols], use_container_width=True, hide_index=True)
 
 st.caption("Auto-updates every 5 min (or press Refresh). ESPN play-by-play is text-based; zones are inferred from descriptions.")
