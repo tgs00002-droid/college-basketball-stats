@@ -1,15 +1,19 @@
 # app.py
 # NCAA Shot Zones Table + Player Headshots (ESPN)
+#
+# Works across ESPN game IDs where play-by-play JSON structure varies.
 # Uses TWO ESPN endpoints:
-#  - playbyplay: to reliably get shot events
-#  - summary: to get boxscore + athlete ids + headshots
+#  - playbyplay: reliable play log (shots come from here)
+#  - summary: boxscore + athlete IDs + headshots (faces come from here)
+#
+# Install:
+#   pip install -r requirements.txt
 #
 # Run:
-#   pip install -r requirements.txt
 #   streamlit run app.py
 
 import re
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 
 import pandas as pd
 import requests
@@ -25,12 +29,12 @@ except Exception:
 # -----------------------------
 # Config
 # -----------------------------
-DEFAULT_GAME_URL = "https://www.espn.com/mens-college-basketball/playbyplay/_/gameId/401822757"
+DEFAULT_GAME_URL = "https://www.espn.com/mens-college-basketball/playbyplay/_/gameId/401817514"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
 
 # -----------------------------
-# Helpers
+# ESPN fetch
 # -----------------------------
 def extract_game_id(espn_url_or_id: str) -> str:
     s = (espn_url_or_id or "").strip()
@@ -92,6 +96,9 @@ def fetch_espn_game_data(game_id: str) -> Dict[str, Any]:
     return {"summary": summary, "pbp": pbp}
 
 
+# -----------------------------
+# Parsing + feature engineering
+# -----------------------------
 def _norm_name(s: str) -> str:
     if not isinstance(s, str):
         return ""
@@ -102,6 +109,9 @@ def _norm_name(s: str) -> str:
 
 
 def classify_zone(text: str) -> str:
+    """
+    Zone inference from shot description text.
+    """
     t = (text or "").lower()
 
     if "free throw" in t:
@@ -119,7 +129,19 @@ def is_shot_play(text: str) -> bool:
     t = (text or "").lower()
     if not any(k in t for k in ["made", "missed"]):
         return False
-    return any(k in t for k in ["jumper", "three point", "layup", "dunk", "free throw", "tip-in", "hook shot", "putback"])
+    return any(
+        k in t
+        for k in [
+            "jumper",
+            "three point",
+            "layup",
+            "dunk",
+            "free throw",
+            "tip-in",
+            "hook shot",
+            "putback",
+        ]
+    )
 
 
 def get_game_header(summary_json: Dict[str, Any]) -> Tuple[str, str]:
@@ -137,13 +159,42 @@ def get_game_header(summary_json: Dict[str, Any]) -> Tuple[str, str]:
     return "Away", "Home"
 
 
+def extract_all_plays(pbp_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    ESPN play-by-play can store plays in multiple shapes.
+    We merge them into one list so parsing doesn't break across games.
+    """
+    plays: List[Dict[str, Any]] = []
+
+    # Case 1: top-level plays
+    if isinstance(pbp_json.get("plays"), list):
+        plays.extend(pbp_json["plays"])
+
+    # Case 2: drives -> plays
+    drives = pbp_json.get("drives", [])
+    if isinstance(drives, list):
+        for d in drives:
+            if isinstance(d, dict) and isinstance(d.get("plays"), list):
+                plays.extend(d["plays"])
+
+    # Case 3: periods -> plays
+    periods = pbp_json.get("periods", [])
+    if isinstance(periods, list):
+        for prd in periods:
+            if isinstance(prd, dict) and isinstance(prd.get("plays"), list):
+                plays.extend(prd["plays"])
+
+    return plays
+
+
 def parse_shots_from_pbp(pbp_json: Dict[str, Any]) -> pd.DataFrame:
-    plays = pbp_json.get("plays", [])
-    if not isinstance(plays, list):
-        plays = []
+    plays = extract_all_plays(pbp_json)
 
     rows = []
     for p in plays:
+        if not isinstance(p, dict):
+            continue
+
         text = (p.get("text") or "").strip()
         if not text or not is_shot_play(text):
             continue
@@ -181,22 +232,30 @@ def parse_shots_from_pbp(pbp_json: Dict[str, Any]) -> pd.DataFrame:
             }
         )
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 def build_player_headshot_lookup(summary_json: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Build (team, player_norm) -> headshot_url from ESPN boxscore athletes.
+    """
     rows = []
     box = summary_json.get("boxscore", {})
     players_blocks = box.get("players", [])
 
+    if not isinstance(players_blocks, list):
+        return pd.DataFrame(columns=["team", "player", "player_norm", "athlete_id", "headshot_url"])
+
     for team_block in players_blocks:
+        if not isinstance(team_block, dict):
+            continue
+
         team_obj = team_block.get("team") or {}
         team_name = team_obj.get("displayName") or team_obj.get("abbreviation")
 
-        for stat_group in team_block.get("statistics", []):
-            for athlete_row in stat_group.get("athletes", []):
-                athlete = athlete_row.get("athlete") or {}
+        for stat_group in team_block.get("statistics", []) or []:
+            for athlete_row in stat_group.get("athletes", []) or []:
+                athlete = (athlete_row or {}).get("athlete") or {}
                 name = athlete.get("displayName") or athlete.get("shortName")
                 athlete_id = athlete.get("id")
 
@@ -223,6 +282,10 @@ def build_player_headshot_lookup(summary_json: Dict[str, Any]) -> pd.DataFrame:
 
 
 def attach_headshots(shots_df: pd.DataFrame, lookup_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach headshot_url to each shot via (team + shooter_norm).
+    Falls back to fuzzy matching if rapidfuzz is installed.
+    """
     shots = shots_df.copy()
     shots["shooter_norm"] = shots["shooter"].map(_norm_name)
 
@@ -233,7 +296,6 @@ def attach_headshots(shots_df: pd.DataFrame, lookup_df: pd.DataFrame) -> pd.Data
         how="left",
     ).drop(columns=["player_norm"])
 
-    # Fuzzy match fallback (helps if pbp uses slightly different naming)
     if RAPIDFUZZ_AVAILABLE:
         missing = merged["headshot_url"].isna()
         if missing.any():
@@ -263,10 +325,7 @@ def attach_headshots(shots_df: pd.DataFrame, lookup_df: pd.DataFrame) -> pd.Data
 
 def zone_summary(df_shots: pd.DataFrame) -> pd.DataFrame:
     out = (
-        df_shots.assign(
-            made=(df_shots["result"] == "Made").astype(int),
-            attempts=1,
-        )
+        df_shots.assign(made=(df_shots["result"] == "Made").astype(int), attempts=1)
         .groupby(["team", "zone"], as_index=False)
         .agg(attempts=("attempts", "sum"), makes=("made", "sum"))
     )
@@ -277,10 +336,7 @@ def zone_summary(df_shots: pd.DataFrame) -> pd.DataFrame:
 
 def player_summary(df_shots: pd.DataFrame) -> pd.DataFrame:
     out = (
-        df_shots.assign(
-            made=(df_shots["result"] == "Made").astype(int),
-            attempts=1,
-        )
+        df_shots.assign(made=(df_shots["result"] == "Made").astype(int), attempts=1)
         .groupby(["team", "shooter"], as_index=False)
         .agg(attempts=("attempts", "sum"), makes=("made", "sum"))
     )
@@ -289,8 +345,18 @@ def player_summary(df_shots: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["team", "attempts"], ascending=[True, False])
 
 
+def clock_to_seconds(c) -> int:
+    if not isinstance(c, str) or ":" not in c:
+        return -1
+    mm, ss = c.split(":")
+    try:
+        return int(mm) * 60 + int(ss)
+    except Exception:
+        return -1
+
+
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 st.set_page_config(page_title="NCAA Shot Zones + Headshots", layout="wide")
 st.title("NCAA Shot Zones Table with Player Headshots")
@@ -306,9 +372,8 @@ with st.sidebar:
 
     st.subheader("Filters")
     zone_filter = st.multiselect(
-        "Zones",
-        ["Rim", "Midrange", "3PT", "Free Throw", "Other"],
-        default=["Rim", "Midrange", "3PT", "Free Throw"],
+        "Zones", ["Rim", "Midrange", "3PT", "Free Throw", "Other"],
+        default=["Rim", "Midrange", "3PT", "Free Throw"]
     )
     result_filter = st.multiselect("Result", ["Made", "Missed"], default=["Made", "Missed"])
 
@@ -333,8 +398,11 @@ if run:
         with st.spinner("Parsing shots from play-by-play..."):
             shots = parse_shots_from_pbp(pbp_json)
 
+        total_plays = len(extract_all_plays(pbp_json))
+        st.caption(f"Plays found: {total_plays} | Shots parsed: {len(shots)}")
+
         if shots.empty:
-            st.warning("Parsed 0 shots from play-by-play. ESPN may not be returning plays for this event.")
+            st.warning("Parsed 0 shots from play-by-play. ESPN may not be returning plays for this event, or the JSON shape changed.")
             st.stop()
 
         with st.spinner("Building headshot lookup from boxscore..."):
@@ -342,12 +410,11 @@ if run:
 
         shots = attach_headshots(shots, lookup)
 
-        # Drop incomplete rows + apply filters
+        # Clean and filter
         shots = shots.dropna(subset=["team", "shooter", "result", "zone"])
         shots = shots[shots["zone"].isin(zone_filter)]
         shots = shots[shots["result"].isin(result_filter)]
 
-        # Layout
         left, right = st.columns([1.25, 1])
 
         with left:
@@ -394,19 +461,11 @@ if run:
             if show_feed:
                 st.subheader("Shot Feed (faces + readable)")
 
-                # Sort: later periods first, clock descending within period
-                def clock_to_seconds(c):
-                    if not isinstance(c, str) or ":" not in c:
-                        return -1
-                    mm, ss = c.split(":")
-                    try:
-                        return int(mm) * 60 + int(ss)
-                    except Exception:
-                        return -1
-
                 feed = shots.copy()
                 feed["clock_sec"] = feed["clock"].map(clock_to_seconds)
-                feed = feed.sort_values(["period", "clock_sec"], ascending=[True, False]).head(120)
+
+                # Sort: by period ascending (P1 then P2), clock descending inside each period
+                feed = feed.sort_values(["period", "clock_sec"], ascending=[True, False]).head(140)
 
                 for _, r in feed.iterrows():
                     c1, c2 = st.columns([1, 6])
