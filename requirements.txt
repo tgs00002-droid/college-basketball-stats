@@ -1,5 +1,7 @@
-# requirements.txt
 streamlit
 pandas
 requests
 rapidfuzz
+lxml
+html5lib
+beautifulsoup4
