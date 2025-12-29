@@ -19,23 +19,13 @@ USER_AGENT = "Mozilla/5.0"
 CACHE_TTL_SECONDS = 300
 
 DEFAULT_GAME_URL = "https://www.espn.com/mens-college-basketball/playbyplay/_/gameId/401817514"
-DEFAULT_ROSTER_TEAM_ID = "120"  # Maryland
-DEFAULT_ROSTER_TEAM_NAME = "Maryland Terrapins"
+MARYLAND_TEAM_ID = "120"
+MARYLAND_NAME_DEFAULT = "Maryland Terrapins"
 
 
 # -----------------------------
-# ESPN fetch helpers
+# HTTP helpers
 # -----------------------------
-def extract_game_id(url_or_id: str) -> str:
-    s = (url_or_id or "").strip()
-    if s.isdigit():
-        return s
-    m = re.search(r"gameId/(\d+)", s)
-    if m:
-        return m.group(1)
-    raise ValueError("Could not find gameId. Paste an ESPN URL with /gameId/######### or just the numeric id.")
-
-
 def safe_get(url: str) -> requests.Response:
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
     r.raise_for_status()
@@ -43,8 +33,21 @@ def safe_get(url: str) -> requests.Response:
 
 
 def safe_get_json(url: str) -> Dict[str, Any]:
-    r = safe_get(url)
-    return r.json()
+    return safe_get(url).json()
+
+
+def extract_game_id(url_or_id: str) -> str:
+    s = (url_or_id or "").strip()
+    if s.isdigit():
+        return s
+    m = re.search(r"gameId/(\d+)", s)
+    if m:
+        return m.group(1)
+    # also allow /gameId=#### in query
+    m2 = re.search(r"gameId=(\d+)", s)
+    if m2:
+        return m2.group(1)
+    raise ValueError("Could not find gameId. Paste an ESPN URL with /gameId/######### or just the numeric id.")
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
@@ -67,18 +70,21 @@ def fetch_team_roster(team_id: str) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def fetch_pbp_html_tables(game_id: str) -> List[pd.DataFrame]:
-    """
-    Fallback: scrape ESPN play-by-play webpage tables when JSON API returns 0 plays.
-    """
     url = f"https://www.espn.com/mens-college-basketball/playbyplay/_/gameId/{game_id}"
     html = safe_get(url).text
-    # ESPN has multiple tables (often one per half/OT)
-    tables = pd.read_html(html)
-    return tables
+    return pd.read_html(html)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
+def fetch_team_schedule(team_id: str) -> Dict[str, Any]:
+    # Team schedule endpoint
+    return safe_get_json(
+        f"https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams/{team_id}/schedule"
+    )
 
 
 # -----------------------------
-# Parsing helpers
+# Parsing
 # -----------------------------
 def normalize_name(name: str) -> str:
     if not isinstance(name, str):
@@ -149,7 +155,6 @@ def shot_value(text: str) -> int:
 
 def infer_zone(text: str) -> str:
     t = (text or "").lower()
-
     if "free throw" in t:
         return "Free Throw"
 
@@ -198,40 +203,51 @@ def infer_zone(text: str) -> str:
     return "Other"
 
 
+def teams_from_summary(summary_json: Dict[str, Any]) -> Tuple[str, str]:
+    away = ""
+    home = ""
+    comps = summary_json.get("header", {}).get("competitions", [])
+    if comps:
+        competitors = comps[0].get("competitors", []) or []
+        for c in competitors:
+            team = c.get("team") or {}
+            name = team.get("displayName") or ""
+            ha = (c.get("homeAway") or "").lower()
+            if ha == "away":
+                away = name
+            elif ha == "home":
+                home = name
+    return away, home
+
+
 def extract_all_plays(pbp_json: Dict[str, Any]) -> List[Dict[str, Any]]:
     plays: List[Dict[str, Any]] = []
-
     if isinstance(pbp_json.get("plays"), list):
         plays.extend(pbp_json["plays"])
-
     drives = pbp_json.get("drives", [])
     if isinstance(drives, list):
         for d in drives:
             if isinstance(d, dict) and isinstance(d.get("plays"), list):
                 plays.extend(d["plays"])
-
     periods = pbp_json.get("periods", [])
     if isinstance(periods, list):
         for prd in periods:
             if isinstance(prd, dict) and isinstance(prd.get("plays"), list):
                 plays.extend(prd["plays"])
-
     return plays
 
 
 def parse_shots_from_api(pbp_json: Dict[str, Any]) -> pd.DataFrame:
     schema = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
     plays = extract_all_plays(pbp_json)
-
     rows = []
+
     for p in plays:
         if not isinstance(p, dict):
             continue
-
         text = (p.get("text") or "").strip()
         if not text or not is_shot(text):
             continue
-
         result = parse_result(text)
         if not result:
             continue
@@ -254,10 +270,8 @@ def parse_shots_from_api(pbp_json: Dict[str, Any]) -> pd.DataFrame:
         pts = val if result == "Made" else 0
 
         rows.append(
-            dict(
-                team=team, period=period, clock=clock, shooter=shooter, result=result,
-                zone=zone, shot_value=val, pts=pts, description=text
-            )
+            dict(team=team, period=period, clock=clock, shooter=shooter, result=result,
+                 zone=zone, shot_value=val, pts=pts, description=text)
         )
 
     df = pd.DataFrame(rows)
@@ -267,37 +281,8 @@ def parse_shots_from_api(pbp_json: Dict[str, Any]) -> pd.DataFrame:
     return df[schema]
 
 
-def teams_from_summary(summary_json: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Returns (away_name, home_name)
-    """
-    away = ""
-    home = ""
-    comps = summary_json.get("header", {}).get("competitions", [])
-    if comps:
-        competitors = comps[0].get("competitors", []) or []
-        # usually: 0 away, 1 home but we won't assume order
-        for c in competitors:
-            team = c.get("team") or {}
-            name = team.get("displayName") or ""
-            ha = (c.get("homeAway") or "").lower()
-            if ha == "away":
-                away = name
-            elif ha == "home":
-                home = name
-    return away, home
-
-
 def parse_shots_from_html_tables(summary_json: Dict[str, Any], tables: List[pd.DataFrame]) -> pd.DataFrame:
-    """
-    ESPN HTML pbp tables typically have:
-      - a time column
-      - one column for away text
-      - one column for home text
-    We'll detect those dynamically.
-    """
     schema = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
-
     away_name, home_name = teams_from_summary(summary_json)
 
     rows = []
@@ -307,38 +292,30 @@ def parse_shots_from_html_tables(summary_json: Dict[str, Any], tables: List[pd.D
         if t is None or t.empty:
             continue
 
-        # Normalize column names
         cols = [str(c).strip().lower() for c in t.columns]
         df = t.copy()
         df.columns = cols
 
-        # Find a likely clock column
+        # find clock col
         clock_col = None
         for c in cols:
             if "time" in c or "clock" in c:
                 clock_col = c
                 break
         if clock_col is None:
-            # sometimes the first column is time
             clock_col = cols[0]
 
-        # Find away/home text columns:
-        # (usually two text columns besides the clock)
         text_cols = [c for c in cols if c != clock_col]
         if len(text_cols) < 2:
-            # not a pbp table
             continue
 
-        away_col = text_cols[0]
-        home_col = text_cols[1]
+        away_col, home_col = text_cols[0], text_cols[1]
 
         for _, r in df.iterrows():
             clock = r.get(clock_col, None)
-
             away_txt = r.get(away_col, None)
             home_txt = r.get(home_col, None)
 
-            # pick whichever side has text
             team = None
             text = None
 
@@ -349,10 +326,7 @@ def parse_shots_from_html_tables(summary_json: Dict[str, Any], tables: List[pd.D
                 team = home_name or "Home"
                 text = home_txt.strip()
 
-            if not text:
-                continue
-
-            if not is_shot(text):
+            if not text or not is_shot(text):
                 continue
 
             result = parse_result(text)
@@ -365,17 +339,8 @@ def parse_shots_from_html_tables(summary_json: Dict[str, Any], tables: List[pd.D
             pts = val if result == "Made" else 0
 
             rows.append(
-                dict(
-                    team=team,
-                    period=period_guess,  # HTML tables don't always label the period cleanly; this is a usable proxy
-                    clock=clock,
-                    shooter=shooter,
-                    result=result,
-                    zone=zone,
-                    shot_value=val,
-                    pts=pts,
-                    description=text,
-                )
+                dict(team=team, period=period_guess, clock=clock, shooter=shooter, result=result,
+                     zone=zone, shot_value=val, pts=pts, description=text)
             )
 
         period_guess += 1
@@ -388,9 +353,9 @@ def parse_shots_from_html_tables(summary_json: Dict[str, Any], tables: List[pd.D
 
 
 # -----------------------------
-# Roster headshots lookup
+# Headshots (roster)
 # -----------------------------
-def build_roster_headshots(team_id: str, team_name: str) -> pd.DataFrame:
+def build_roster_headshots(team_id: str) -> pd.DataFrame:
     roster_json = fetch_team_roster(team_id)
     rows = []
     for a in roster_json.get("athletes", []) or []:
@@ -404,8 +369,7 @@ def build_roster_headshots(team_id: str, team_name: str) -> pd.DataFrame:
                     "headshot_url": f"https://a.espncdn.com/i/headshots/mens-college-basketball/players/full/{aid}.png",
                 }
             )
-    df = pd.DataFrame(rows).drop_duplicates(subset=["player_norm"])
-    return df
+    return pd.DataFrame(rows).drop_duplicates(subset=["player_norm"])
 
 
 def attach_headshots(shots: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
@@ -440,7 +404,143 @@ def attach_headshots(shots: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# Tables & styling
+# Schedule -> list of games
+# -----------------------------
+def parse_schedule(schedule_json: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    events = schedule_json.get("events", []) or []
+    for e in events:
+        eid = e.get("id")
+        date = e.get("date")
+        name = e.get("name")  # "Maryland Terrapins vs Virginia Cavaliers"
+        comp = (e.get("competitions") or [{}])[0]
+        competitors = comp.get("competitors", []) or []
+
+        home = away = ""
+        home_score = away_score = None
+        for c in competitors:
+            t = c.get("team") or {}
+            ha = (c.get("homeAway") or "").lower()
+            if ha == "home":
+                home = t.get("displayName", "")
+                home_score = c.get("score")
+            elif ha == "away":
+                away = t.get("displayName", "")
+                away_score = c.get("score")
+
+        # Determine opponent and home/away for Maryland
+        if home and "Maryland" in home:
+            home_away = "Home"
+            opponent = away
+        elif away and "Maryland" in away:
+            home_away = "Away"
+            opponent = home
+        else:
+            home_away = ""
+            opponent = ""
+
+        # status / outcome
+        status = ((e.get("status") or {}).get("type") or {}).get("name") or ""
+        outcome = ""
+        try:
+            hs = int(home_score) if home_score is not None else None
+            a_s = int(away_score) if away_score is not None else None
+            if hs is not None and a_s is not None:
+                maryland_score = hs if home_away == "Home" else a_s
+                opp_score = a_s if home_away == "Home" else hs
+                if maryland_score > opp_score:
+                    outcome = "W"
+                elif maryland_score < opp_score:
+                    outcome = "L"
+        except Exception:
+            pass
+
+        rows.append(
+            {
+                "game_id": str(eid) if eid else None,
+                "date": date,
+                "opponent": opponent,
+                "home_away": home_away,
+                "status": status,
+                "outcome": outcome,
+                "home": home,
+                "away": away,
+                "home_score": home_score,
+                "away_score": away_score,
+                "name": name,
+            }
+        )
+
+    df = pd.DataFrame(rows).dropna(subset=["game_id"])
+    # nicer date display
+    if "date" in df.columns:
+        df["date_short"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
+    else:
+        df["date_short"] = ""
+    return df
+
+
+def fetch_and_parse_shots_for_game(game_id: str) -> Tuple[pd.DataFrame, str, int]:
+    """
+    Returns: (shots_df, source_used, api_plays_found)
+    """
+    data = fetch_game_data(game_id)
+    summary_json = data["summary"]
+    pbp_json = data["pbp"]
+
+    api_plays_found = len(extract_all_plays(pbp_json))
+    shots_api = parse_shots_from_api(pbp_json)
+
+    shots = shots_api
+    source_used = "ESPN JSON API"
+    if api_plays_found == 0 or len(shots_api) == 0:
+        try:
+            tables = fetch_pbp_html_tables(game_id)
+            shots_html = parse_shots_from_html_tables(summary_json, tables)
+            if len(shots_html) > 0:
+                shots = shots_html
+                source_used = "ESPN HTML (pandas.read_html fallback)"
+        except Exception:
+            pass
+
+    return shots, source_used, api_plays_found
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
+def build_season_shots(team_id: str, max_games: int = 50) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      shots_all (stacked shots across games)
+      schedule_df (parsed schedule)
+    """
+    schedule_json = fetch_team_schedule(team_id)
+    sched = parse_schedule(schedule_json)
+
+    # Only keep games that have an id (most do). Limit to max_games to avoid long runs.
+    sched_use = sched.head(max_games).copy()
+
+    all_frames = []
+    for _, r in sched_use.iterrows():
+        gid = r["game_id"]
+        shots_df, source_used, api_plays_found = fetch_and_parse_shots_for_game(gid)
+        if shots_df is None or shots_df.empty:
+            continue
+
+        shots_df = shots_df.copy()
+        shots_df["game_id"] = gid
+        shots_df["date"] = r.get("date_short", "")
+        shots_df["opponent"] = r.get("opponent", "")
+        shots_df["home_away"] = r.get("home_away", "")
+        shots_df["source_used"] = source_used
+        shots_df["api_plays_found"] = api_plays_found
+        all_frames.append(shots_df)
+
+    shots_all = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+    return shots_all, sched
+
+
+# -----------------------------
+# Summary tables
 # -----------------------------
 ZONE_ORDER = [
     "Restricted Area",
@@ -456,7 +556,7 @@ ZONE_ORDER = [
 
 
 def zone_breakdown(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
+    if df is None or df.empty:
         return pd.DataFrame(columns=["Zone", "FGM", "FGA", "PTS/shot", "FG%", "PTS", "Shot Share"])
 
     x = df.copy()
@@ -509,7 +609,7 @@ def style_zone_table(df: pd.DataFrame):
 
 
 def header_line(df_player: pd.DataFrame) -> Tuple[int, float, float, float]:
-    if df_player.empty:
+    if df_player is None or df_player.empty:
         return 0, 0.0, 0.0, 0.0
 
     pts = int(df_player["pts"].sum())
@@ -529,122 +629,193 @@ def header_line(df_player: pd.DataFrame) -> Tuple[int, float, float, float]:
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="College Basketball Shooting — ESPN", layout="wide")
+st.set_page_config(page_title="Maryland Shooting — ESPN", layout="wide")
 
-top_left, top_right = st.columns([1.6, 8.4])
+top_left, _ = st.columns([1.8, 8.2])
 with top_left:
     refresh = st.button("Refresh data now\n(pull latest)")
-with top_right:
-    st.markdown("")
 
 st.title("College Basketball Shooting — ESPN Play-by-Play")
 
 with st.sidebar:
     st.header("Filters")
-    game_input = st.text_input("Paste ESPN play-by-play URL or gameId:", value=DEFAULT_GAME_URL)
 
-    st.subheader("Roster (headshots fallback)")
-    roster_team_id = st.text_input("Roster teamId (ex: Maryland = 120)", value=DEFAULT_ROSTER_TEAM_ID)
-    roster_team_name = st.text_input("Roster team name", value=DEFAULT_ROSTER_TEAM_NAME)
+    mode = st.radio("Mode", ["Maryland season (aggregate)", "Single game"], index=0)
+
+    st.subheader("Roster (headshots)")
+    roster_team_id = st.text_input("Roster teamId (Maryland = 120)", value=MARYLAND_TEAM_ID)
+    roster_team_name = st.text_input("Roster team name", value=MARYLAND_NAME_DEFAULT)
+
+    if mode == "Single game":
+        game_input = st.text_input("Paste ESPN play-by-play URL or gameId:", value=DEFAULT_GAME_URL)
+    else:
+        max_games = st.slider("How many schedule games to include", min_value=5, max_value=40, value=25, step=1)
 
     if refresh:
         fetch_game_data.clear()
         fetch_team_roster.clear()
         fetch_pbp_html_tables.clear()
+        fetch_team_schedule.clear()
+        build_season_shots.clear()
 
-game_id = extract_game_id(game_input)
+# Headshots lookup (used both modes)
+roster_lookup = build_roster_headshots(roster_team_id.strip())
 
-data = fetch_game_data(game_id)
-summary_json = data["summary"]
-pbp_json = data["pbp"]
+# -----------------------------
+# Mode: Season aggregate
+# -----------------------------
+if mode == "Maryland season (aggregate)":
+    with st.spinner("Loading Maryland schedule and aggregating shots across games..."):
+        shots_all, sched = build_season_shots(roster_team_id.strip(), max_games=max_games)
 
-plays_found = len(extract_all_plays(pbp_json))
+    # Sidebar schedule display (simple)
+    st.sidebar.subheader("Maryland schedule (from ESPN)")
+    if sched is not None and not sched.empty:
+        show_sched = sched[["date_short", "opponent", "home_away", "outcome", "home_score", "away_score"]].copy()
+        show_sched.rename(
+            columns={
+                "date_short": "Date",
+                "opponent": "Opponent",
+                "home_away": "H/A",
+                "outcome": "W/L",
+                "home_score": "Home",
+                "away_score": "Away",
+            },
+            inplace=True,
+        )
+        st.sidebar.dataframe(show_sched, use_container_width=True, height=320, hide_index=True)
 
-# parse from API first
-shots_api = parse_shots_from_api(pbp_json)
+    if shots_all is None or shots_all.empty:
+        st.warning("No shots parsed from the season games pulled. Try increasing max games or click Refresh.")
+        st.stop()
 
-# if API is empty, scrape HTML tables
-shots = shots_api
-source_used = "ESPN JSON API"
-if plays_found == 0 or len(shots_api) == 0:
-    try:
-        tables = fetch_pbp_html_tables(game_id)
-        shots_html = parse_shots_from_html_tables(summary_json, tables)
-        if len(shots_html) > 0:
-            shots = shots_html
-            source_used = "ESPN HTML (pandas.read_html fallback)"
-    except Exception:
-        pass
+    # Attach headshots
+    shots_all = attach_headshots(shots_all, roster_lookup)
 
-# roster lookup always available
-roster_lookup = build_roster_headshots(roster_team_id.strip(), roster_team_name.strip())
+    # Filters
+    with st.sidebar:
+        st.subheader("Season filters")
+        game_opts = ["All"] + sorted(shots_all["game_id"].unique().tolist())
+        game_pick = st.selectbox("Game", options=game_opts, index=0)
 
-st.caption(
-    f"Game ID: {game_id} | API plays found: {plays_found} | Shots parsed: {len(shots)} | Source: {source_used}"
-)
+        opp_opts = ["All"] + sorted([x for x in shots_all["opponent"].dropna().unique().tolist() if str(x).strip()])
+        opp_pick = st.selectbox("Opponent", options=opp_opts, index=0)
 
-# attach headshots if shots exist
-if len(shots) > 0:
-    shots = attach_headshots(shots, roster_lookup)
+        zone_opts = ["All"] + sorted(shots_all["zone"].dropna().unique().tolist())
+        zone_pick = st.selectbox("Zone", options=zone_opts, index=0)
 
-# if STILL no shots, show roster grid and stop
-if len(shots) == 0:
-    st.warning(
-        "Could not parse shots from ESPN API or HTML tables for this game. "
-        "Showing roster headshots so the app still looks good."
+        res_opts = ["All", "Made", "Missed"]
+        res_pick = st.selectbox("Result", options=res_opts, index=0)
+
+        player_opts = sorted(shots_all["shooter"].dropna().unique().tolist())
+        player_pick = st.selectbox("Player", options=player_opts, index=0 if player_opts else 0)
+
+    filt = shots_all.copy()
+    if game_pick != "All":
+        filt = filt[filt["game_id"] == game_pick]
+    if opp_pick != "All":
+        filt = filt[filt["opponent"] == opp_pick]
+    if zone_pick != "All":
+        filt = filt[filt["zone"] == zone_pick]
+    if res_pick != "All":
+        filt = filt[filt["result"] == res_pick]
+
+    player_df = filt[filt["shooter"] == player_pick].copy()
+
+    st.caption(
+        f"Season shots: {len(shots_all)} | Filtered shots: {len(filt)} | Player shots: {len(player_df)}"
     )
 
-    st.subheader(f"{roster_team_name} — Roster Headshots")
-    roster_show = roster_lookup.sort_values("player")
+    # Header
+    left, right = st.columns([1.5, 8.5])
+    with left:
+        vals = player_df["headshot_url"].dropna().unique().tolist() if "headshot_url" in player_df.columns else []
+        hs = vals[0] if vals else None
+        if isinstance(hs, str) and hs.startswith("http"):
+            st.image(hs, width=120)
+    with right:
+        st.subheader(f"{player_pick} — Season Shooting Profile (Aggregated)")
+        pts, fg, three_pct, ft_pct = header_line(player_df)
+        st.caption(f"PTS: {pts}  |  FG%: {fg*100:.1f}%  |  3P%: {three_pct*100:.1f}%  |  FT%: {ft_pct*100:.1f}%")
+        st.caption("FG% color bands: Red < 30%, Yellow 30–40%, Green > 40%")
 
-    cols = st.columns(6)
-    for i, (_, r) in enumerate(roster_show.iterrows()):
-        with cols[i % 6]:
-            st.image(r["headshot_url"], width=95)
-            st.caption(r["player"])
-    st.stop()
+    st.divider()
 
-teams = sorted([t for t in shots["team"].dropna().unique().tolist()])
-with st.sidebar:
-    team_choice = st.selectbox("Choose a team:", options=["All"] + teams, index=0)
+    tab1, tab2, tab3 = st.tabs(["Zone breakdown", "Shot log", "Download"])
+    with tab1:
+        zb = zone_breakdown(player_df).reset_index(drop=True)
+        zb.insert(0, "", zb.index)
+        st.dataframe(style_zone_table(zb), use_container_width=True, hide_index=True)
 
-shots_team = shots.copy()
-if team_choice != "All":
-    shots_team = shots_team[shots_team["team"] == team_choice]
+    with tab2:
+        cols = ["date", "opponent", "home_away", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
+        if "headshot_url" in player_df.columns:
+            cols.append("headshot_url")
+        st.dataframe(player_df[cols], use_container_width=True, hide_index=True)
 
-players = sorted([p for p in shots_team["shooter"].dropna().unique().tolist()])
-with st.sidebar:
-    player_choice = st.selectbox("Choose a player:", options=players, index=0 if players else 0)
+    with tab3:
+        csv1 = filt.to_csv(index=False).encode("utf-8")
+        st.download_button("Download filtered season shots CSV", data=csv1, file_name="maryland_season_shots_filtered.csv")
 
-shots_player = shots_team[shots_team["shooter"] == player_choice].copy()
+        csv2 = shots_all.to_csv(index=False).encode("utf-8")
+        st.download_button("Download full season shots CSV", data=csv2, file_name="maryland_season_shots_full.csv")
 
-# Header
-left, right = st.columns([1.5, 8.5])
-with left:
-    vals = shots_player["headshot_url"].dropna().unique().tolist() if "headshot_url" in shots_player.columns else []
-    hs = vals[0] if vals else None
-    if isinstance(hs, str) and hs.startswith("http"):
-        st.image(hs, width=120)
+    st.caption("Season mode pulls Maryland schedule from ESPN and aggregates shots across games. Zones inferred from text.")
 
-with right:
-    st.subheader(f"{player_choice} — Single Game Shooting Profile")
-    pts, fg, three_pct, ft_pct = header_line(shots_player)
-    st.caption(f"PTS: {pts}  |  FG%: {fg*100:.1f}%  |  3P%: {three_pct*100:.1f}%  |  FT%: {ft_pct*100:.1f}%")
-    st.caption("FG% color bands: Red < 30%, Yellow 30–40%, Green > 40%")
+# -----------------------------
+# Mode: Single game (your original)
+# -----------------------------
+else:
+    game_id = extract_game_id(game_input)
+    shots, source_used, api_plays_found = fetch_and_parse_shots_for_game(game_id)
 
-st.divider()
+    st.caption(f"Game ID: {game_id} | API plays found: {api_plays_found} | Shots parsed: {len(shots)} | Source: {source_used}")
 
-tab1, tab2 = st.tabs(["Zone breakdown", "Shot log"])
+    if shots is None or shots.empty:
+        st.warning("No shots parsed for this game. Try another gameId or click Refresh.")
+        st.stop()
 
-with tab1:
-    zb = zone_breakdown(shots_player).reset_index(drop=True)
-    zb.insert(0, "", zb.index)
-    st.dataframe(style_zone_table(zb), use_container_width=True, hide_index=True)
+    shots = attach_headshots(shots, roster_lookup)
 
-with tab2:
-    show_cols = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
-    if "headshot_url" in shots_team.columns:
-        show_cols.append("headshot_url")
-    st.dataframe(shots_team[show_cols], use_container_width=True, hide_index=True)
+    teams = sorted([t for t in shots["team"].dropna().unique().tolist()])
+    with st.sidebar:
+        team_choice = st.selectbox("Choose a team:", options=["All"] + teams, index=0)
 
-st.caption("Auto-updates every 5 min (or press Refresh). Zones are inferred from descriptions.")
+    shots_team = shots.copy()
+    if team_choice != "All":
+        shots_team = shots_team[shots_team["team"] == team_choice]
+
+    players = sorted([p for p in shots_team["shooter"].dropna().unique().tolist()])
+    with st.sidebar:
+        player_choice = st.selectbox("Choose a player:", options=players, index=0 if players else 0)
+
+    shots_player = shots_team[shots_team["shooter"] == player_choice].copy()
+
+    left, right = st.columns([1.5, 8.5])
+    with left:
+        vals = shots_player["headshot_url"].dropna().unique().tolist() if "headshot_url" in shots_player.columns else []
+        hs = vals[0] if vals else None
+        if isinstance(hs, str) and hs.startswith("http"):
+            st.image(hs, width=120)
+
+    with right:
+        st.subheader(f"{player_choice} — Single Game Shooting Profile")
+        pts, fg, three_pct, ft_pct = header_line(shots_player)
+        st.caption(f"PTS: {pts}  |  FG%: {fg*100:.1f}%  |  3P%: {three_pct*100:.1f}%  |  FT%: {ft_pct*100:.1f}%")
+        st.caption("FG% color bands: Red < 30%, Yellow 30–40%, Green > 40%")
+
+    st.divider()
+
+    tab1, tab2 = st.tabs(["Zone breakdown", "Shot log"])
+    with tab1:
+        zb = zone_breakdown(shots_player).reset_index(drop=True)
+        zb.insert(0, "", zb.index)
+        st.dataframe(style_zone_table(zb), use_container_width=True, hide_index=True)
+
+    with tab2:
+        show_cols = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
+        if "headshot_url" in shots_team.columns:
+            show_cols.append("headshot_url")
+        st.dataframe(shots_team[show_cols], use_container_width=True, hide_index=True)
+
+    st.caption("Single-game mode uses ESPN API first, then HTML fallback. Zones inferred from text.")
