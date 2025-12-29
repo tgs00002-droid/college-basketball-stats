@@ -1,19 +1,15 @@
 # app.py
-# Maryland (or any NCAA) Shot Location Table + Player Headshots
-# Data source: ESPN public game summary JSON (no API key needed)
+# NCAA Shot Zones Table + Player Headshots (ESPN)
+# Uses TWO ESPN endpoints:
+#  - playbyplay: to reliably get shot events
+#  - summary: to get boxscore + athlete ids + headshots
 #
 # Run:
-#   pip install streamlit pandas requests rapidfuzz
+#   pip install -r requirements.txt
 #   streamlit run app.py
-#
-# Notes:
-# - ESPN play-by-play text does NOT always include true X/Y shot coordinates.
-#   This app builds "where on the court" via zone inference from shot descriptions:
-#   Rim, Midrange, 3PT, Free Throw, Other.
-# - Player headshots are pulled from ESPN athlete IDs in the boxscore payload.
 
 import re
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Tuple
 
 import pandas as pd
 import requests
@@ -34,7 +30,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 
 
 # -----------------------------
-# Utilities
+# Helpers
 # -----------------------------
 def extract_game_id(espn_url_or_id: str) -> str:
     s = (espn_url_or_id or "").strip()
@@ -46,7 +42,7 @@ def extract_game_id(espn_url_or_id: str) -> str:
     m = re.search(r"event=(\d+)", s)
     if m:
         return m.group(1)
-    raise ValueError("Could not find a gameId in that input. Paste an ESPN URL with /gameId/######### or just the numeric id.")
+    raise ValueError("Could not find a gameId. Paste an ESPN URL with /gameId/######### or just the numeric id.")
 
 
 def _safe_get_json(url: str) -> Dict[str, Any]:
@@ -56,21 +52,44 @@ def _safe_get_json(url: str) -> Dict[str, Any]:
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
-def fetch_espn_summary_json(game_id: str) -> Dict[str, Any]:
+def fetch_espn_game_data(game_id: str) -> Dict[str, Any]:
     """
-    ESPN uses a few hosts for the same API path. Try multiple.
+    Pull both:
+      - summary (boxscore + athletes + headshots)
+      - playbyplay (all plays incl shots)
     """
-    candidates = [
+    summary_candidates = [
         f"https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/summary?event={game_id}",
         f"https://site.web.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/summary?event={game_id}",
     ]
+    pbp_candidates = [
+        f"https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/playbyplay?event={game_id}",
+        f"https://site.web.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/playbyplay?event={game_id}",
+    ]
+
     last_err = None
-    for url in candidates:
+    summary = None
+    for url in summary_candidates:
         try:
-            return _safe_get_json(url)
+            summary = _safe_get_json(url)
+            break
         except Exception as e:
             last_err = e
-    raise RuntimeError(f"Could not fetch ESPN summary JSON for game {game_id}. Last error: {last_err}")
+    if summary is None:
+        raise RuntimeError(f"Could not fetch SUMMARY JSON for game {game_id}. Last error: {last_err}")
+
+    last_err = None
+    pbp = None
+    for url in pbp_candidates:
+        try:
+            pbp = _safe_get_json(url)
+            break
+        except Exception as e:
+            last_err = e
+    if pbp is None:
+        raise RuntimeError(f"Could not fetch PLAY-BY-PLAY JSON for game {game_id}. Last error: {last_err}")
+
+    return {"summary": summary, "pbp": pbp}
 
 
 def _norm_name(s: str) -> str:
@@ -83,10 +102,6 @@ def _norm_name(s: str) -> str:
 
 
 def classify_zone(text: str) -> str:
-    """
-    Zone inference from play text.
-    You can expand this mapping later.
-    """
     t = (text or "").lower()
 
     if "free throw" in t:
@@ -107,34 +122,9 @@ def is_shot_play(text: str) -> bool:
     return any(k in t for k in ["jumper", "three point", "layup", "dunk", "free throw", "tip-in", "hook shot", "putback"])
 
 
-def find_plays_list(game_json: Dict[str, Any]) -> list:
-    """
-    ESPN summary payload usually has a top-level 'plays' list.
-    If not, we scan common nested keys.
-    """
-    if isinstance(game_json.get("plays"), list):
-        return game_json["plays"]
-
-    # Common alternate nesting
-    for key in ["pbp", "playByPlay", "gamecast", "gameCast"]:
-        v = game_json.get(key)
-        if isinstance(v, dict) and isinstance(v.get("plays"), list):
-            return v["plays"]
-
-    # Shallow scan: find first dict that has 'plays'
-    for v in game_json.values():
-        if isinstance(v, dict) and isinstance(v.get("plays"), list):
-            return v["plays"]
-
-    raise RuntimeError("Could not locate a plays list in the ESPN JSON. ESPN payload format may have changed.")
-
-
-def get_game_header(game_json: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Returns (away_team, home_team) display names if available.
-    """
+def get_game_header(summary_json: Dict[str, Any]) -> Tuple[str, str]:
     try:
-        comps = game_json.get("header", {}).get("competitions", [])
+        comps = summary_json.get("header", {}).get("competitions", [])
         if comps:
             competitors = comps[0].get("competitors", [])
             away = next((c for c in competitors if c.get("homeAway") == "away"), None)
@@ -147,10 +137,12 @@ def get_game_header(game_json: Dict[str, Any]) -> Tuple[str, str]:
     return "Away", "Home"
 
 
-def parse_shots(game_json: Dict[str, Any]) -> pd.DataFrame:
-    plays = find_plays_list(game_json)
-    rows = []
+def parse_shots_from_pbp(pbp_json: Dict[str, Any]) -> pd.DataFrame:
+    plays = pbp_json.get("plays", [])
+    if not isinstance(plays, list):
+        plays = []
 
+    rows = []
     for p in plays:
         text = (p.get("text") or "").strip()
         if not text or not is_shot_play(text):
@@ -159,20 +151,23 @@ def parse_shots(game_json: Dict[str, Any]) -> pd.DataFrame:
         low = f" {text.lower()} "
         made = " made " in low
         missed = " missed " in low
+        if not (made or missed):
+            continue
 
-        # Shooter text is usually before 'made'/'missed'
         shooter = re.split(r"\bmade\b|\bmissed\b", text, flags=re.IGNORECASE)[0].strip().strip(".")
-
         zone = classify_zone(text)
 
-        # team info is often present as p["team"]["displayName"] or abbreviation
         team = None
         if isinstance(p.get("team"), dict):
             team = p["team"].get("displayName") or p["team"].get("abbreviation")
 
-        # clock/period
-        clock = p.get("clock", {}).get("displayValue") if isinstance(p.get("clock"), dict) else p.get("clock")
-        period = p.get("period", {}).get("number") if isinstance(p.get("period"), dict) else p.get("period")
+        clock = None
+        if isinstance(p.get("clock"), dict):
+            clock = p["clock"].get("displayValue")
+
+        period = None
+        if isinstance(p.get("period"), dict):
+            period = p["period"].get("number")
 
         rows.append(
             {
@@ -180,26 +175,19 @@ def parse_shots(game_json: Dict[str, Any]) -> pd.DataFrame:
                 "period": period,
                 "clock": clock,
                 "shooter": shooter,
-                "result": "Made" if made else ("Missed" if missed else None),
+                "result": "Made" if made else "Missed",
                 "zone": zone,
                 "description": text,
             }
         )
 
     df = pd.DataFrame(rows)
-    if df.empty:
-        raise RuntimeError("No shots parsed from play-by-play. ESPN may not be returning shot text in this payload.")
     return df
 
 
-def build_player_headshot_lookup(game_json: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Builds player -> headshot_url lookup from boxscore.
-    ESPN often includes athlete.id and headshot.href.
-    If headshot missing but id exists, we construct a standard ESPN headshot URL.
-    """
+def build_player_headshot_lookup(summary_json: Dict[str, Any]) -> pd.DataFrame:
     rows = []
-    box = game_json.get("boxscore", {})
+    box = summary_json.get("boxscore", {})
     players_blocks = box.get("players", [])
 
     for team_block in players_blocks:
@@ -235,15 +223,9 @@ def build_player_headshot_lookup(game_json: Dict[str, Any]) -> pd.DataFrame:
 
 
 def attach_headshots(shots_df: pd.DataFrame, lookup_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Attach headshot_url to each shot based on (team + shooter name).
-    Uses exact normalized match first.
-    Optionally uses fuzzy match if rapidfuzz is installed.
-    """
     shots = shots_df.copy()
     shots["shooter_norm"] = shots["shooter"].map(_norm_name)
 
-    # Exact join: team + normalized shooter name
     merged = shots.merge(
         lookup_df[["team", "player_norm", "headshot_url", "player"]],
         left_on=["team", "shooter_norm"],
@@ -251,7 +233,7 @@ def attach_headshots(shots_df: pd.DataFrame, lookup_df: pd.DataFrame) -> pd.Data
         how="left",
     ).drop(columns=["player_norm"])
 
-    # If missing headshots and rapidfuzz is available, do fuzzy matching within each team
+    # Fuzzy match fallback (helps if pbp uses slightly different naming)
     if RAPIDFUZZ_AVAILABLE:
         missing = merged["headshot_url"].isna()
         if missing.any():
@@ -259,7 +241,6 @@ def attach_headshots(shots_df: pd.DataFrame, lookup_df: pd.DataFrame) -> pd.Data
             for team_name in filled.loc[missing, "team"].dropna().unique():
                 team_lookup = lookup_df[lookup_df["team"] == team_name]
                 choices = list(team_lookup["player_norm"].unique())
-
                 if not choices:
                     continue
 
@@ -287,10 +268,7 @@ def zone_summary(df_shots: pd.DataFrame) -> pd.DataFrame:
             attempts=1,
         )
         .groupby(["team", "zone"], as_index=False)
-        .agg(
-            attempts=("attempts", "sum"),
-            makes=("made", "sum"),
-        )
+        .agg(attempts=("attempts", "sum"), makes=("made", "sum"))
     )
     out["misses"] = out["attempts"] - out["makes"]
     out["fg_pct"] = (out["makes"] / out["attempts"]).round(3)
@@ -304,10 +282,7 @@ def player_summary(df_shots: pd.DataFrame) -> pd.DataFrame:
             attempts=1,
         )
         .groupby(["team", "shooter"], as_index=False)
-        .agg(
-            attempts=("attempts", "sum"),
-            makes=("made", "sum"),
-        )
+        .agg(attempts=("attempts", "sum"), makes=("made", "sum"))
     )
     out["misses"] = out["attempts"] - out["makes"]
     out["fg_pct"] = (out["makes"] / out["attempts"]).round(3)
@@ -318,19 +293,23 @@ def player_summary(df_shots: pd.DataFrame) -> pd.DataFrame:
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="NCAA Shot Zones + Headshots", layout="wide")
-
 st.title("NCAA Shot Zones Table with Player Headshots")
 
 with st.sidebar:
     st.subheader("Game Input")
     game_input = st.text_input("Paste ESPN play-by-play URL or gameId", value=DEFAULT_GAME_URL)
+
     show_shot_log = st.checkbox("Show shot log table", value=True)
     show_zone_table = st.checkbox("Show zone summary table", value=True)
     show_player_table = st.checkbox("Show player summary table", value=True)
     show_feed = st.checkbox("Show shot feed with faces", value=True)
 
     st.subheader("Filters")
-    zone_filter = st.multiselect("Zones", ["Rim", "Midrange", "3PT", "Free Throw", "Other"], default=["Rim", "Midrange", "3PT", "Free Throw"])
+    zone_filter = st.multiselect(
+        "Zones",
+        ["Rim", "Midrange", "3PT", "Free Throw", "Other"],
+        default=["Rim", "Midrange", "3PT", "Free Throw"],
+    )
     result_filter = st.multiselect("Result", ["Made", "Missed"], default=["Made", "Missed"])
 
     st.subheader("Export")
@@ -341,29 +320,35 @@ run = st.button("Load Game")
 if run:
     try:
         game_id = extract_game_id(game_input)
-        with st.spinner("Fetching ESPN data..."):
-            game_json = fetch_espn_summary_json(game_id)
 
-        away, home = get_game_header(game_json)
+        with st.spinner("Fetching ESPN summary + play-by-play..."):
+            game_data = fetch_espn_game_data(game_id)
+
+        summary_json = game_data["summary"]
+        pbp_json = game_data["pbp"]
+
+        away, home = get_game_header(summary_json)
         st.caption(f"Game ID: {game_id} | Away: {away} | Home: {home}")
 
-        with st.spinner("Parsing shots..."):
-            shots = parse_shots(game_json)
+        with st.spinner("Parsing shots from play-by-play..."):
+            shots = parse_shots_from_pbp(pbp_json)
 
-        # Headshots lookup
-        with st.spinner("Building headshot lookup..."):
-            lookup = build_player_headshot_lookup(game_json)
+        if shots.empty:
+            st.warning("Parsed 0 shots from play-by-play. ESPN may not be returning plays for this event.")
+            st.stop()
 
-        # Attach headshots
+        with st.spinner("Building headshot lookup from boxscore..."):
+            lookup = build_player_headshot_lookup(summary_json)
+
         shots = attach_headshots(shots, lookup)
 
-        # Clean / filter
-        shots = shots.dropna(subset=["team", "shooter", "result"])
+        # Drop incomplete rows + apply filters
+        shots = shots.dropna(subset=["team", "shooter", "result", "zone"])
         shots = shots[shots["zone"].isin(zone_filter)]
         shots = shots[shots["result"].isin(result_filter)]
 
         # Layout
-        left, right = st.columns([1.2, 1])
+        left, right = st.columns([1.25, 1])
 
         with left:
             if show_zone_table:
@@ -408,30 +393,36 @@ if run:
         with right:
             if show_feed:
                 st.subheader("Shot Feed (faces + readable)")
-                shots_feed = shots.sort_values(["period", "clock"], ascending=[True, False]).head(80)
 
-                for _, r in shots_feed.iterrows():
+                # Sort: later periods first, clock descending within period
+                def clock_to_seconds(c):
+                    if not isinstance(c, str) or ":" not in c:
+                        return -1
+                    mm, ss = c.split(":")
+                    try:
+                        return int(mm) * 60 + int(ss)
+                    except Exception:
+                        return -1
+
+                feed = shots.copy()
+                feed["clock_sec"] = feed["clock"].map(clock_to_seconds)
+                feed = feed.sort_values(["period", "clock_sec"], ascending=[True, False]).head(120)
+
+                for _, r in feed.iterrows():
                     c1, c2 = st.columns([1, 6])
                     with c1:
-                        if pd.notna(r.get("headshot_url")) and str(r["headshot_url"]).startswith("http"):
-                            st.image(r["headshot_url"], width=56)
-                        else:
-                            st.write("")
+                        url = r.get("headshot_url")
+                        if isinstance(url, str) and url.startswith("http"):
+                            st.image(url, width=56)
                     with c2:
-                        st.write(
-                            f"{r['team']} | P{r['period']} {r['clock']} | {r['shooter']} | {r['result']} | {r['zone']}"
-                        )
+                        st.write(f"{r['team']} | P{r['period']} {r['clock']} | {r['shooter']} | {r['result']} | {r['zone']}")
                         st.caption(r["description"])
 
         st.success("Done.")
 
     except Exception as e:
         st.error(str(e))
-        st.info(
-            "If this specific game payload is missing plays or boxscore athletes, try a different gameId. "
-            "ESPN sometimes changes the JSON shape per event."
-        )
+        st.info("Tip: paste a full ESPN play-by-play URL with /gameId/######### or just the gameId number.")
 
 else:
     st.info("Click Load Game to build the shot-zone tables and headshot feed.")
-
