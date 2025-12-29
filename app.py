@@ -1,30 +1,10 @@
-# app.py
-# NCAA Shooting Dashboard (ESPN) — styled like your NBA.com Streamlit app screenshot
-#
-# What it does
-# - Paste an ESPN NCAA men's game play-by-play URL (or gameId)
-# - Select Team + Player
-# - Shows a clean header with player headshot + team logo + quick shooting line
-# - Tabs:
-#   1) Zone breakdown (table with FG% color bands like your NBA app)
-#   2) Team overview (all players + zone totals)
-# - “Refresh data now (pull latest)” button
-#
-# Install
-#   pip install -r requirements.txt
-#
-# Run
-#   streamlit run app.py
-
 import re
-from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 
-# optional fuzzy name matching
 try:
     from rapidfuzz import process, fuzz
     RAPIDFUZZ_AVAILABLE = True
@@ -32,17 +12,17 @@ except Exception:
     RAPIDFUZZ_AVAILABLE = False
 
 
-# =========================
+# -----------------------------
 # Config
-# =========================
+# -----------------------------
 USER_AGENT = "Mozilla/5.0"
+CACHE_TTL_SECONDS = 300  # 5 minutes
 DEFAULT_GAME_URL = "https://www.espn.com/mens-college-basketball/playbyplay/_/gameId/401817514"
-CACHE_TTL_SECONDS = 300  # 5 minutes like your NBA app auto-refresh note
 
 
-# =========================
-# ESPN fetch
-# =========================
+# -----------------------------
+# ESPN fetch helpers
+# -----------------------------
 def extract_game_id(url_or_id: str) -> str:
     s = (url_or_id or "").strip()
     if s.isdigit():
@@ -70,9 +50,17 @@ def fetch_game_data(game_id: str) -> Dict[str, Any]:
     return {"summary": summary, "pbp": pbp}
 
 
-# =========================
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
+def fetch_team_roster(team_id: str) -> Dict[str, Any]:
+    # This is the JSON equivalent of the roster page you linked
+    return safe_get_json(
+        f"https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams/{team_id}/roster"
+    )
+
+
+# -----------------------------
 # Parsing helpers
-# =========================
+# -----------------------------
 def normalize_name(name: str) -> str:
     if not isinstance(name, str):
         return ""
@@ -84,6 +72,7 @@ def normalize_name(name: str) -> str:
 
 def extract_all_plays(pbp_json: Dict[str, Any]) -> List[Dict[str, Any]]:
     plays: List[Dict[str, Any]] = []
+
     if isinstance(pbp_json.get("plays"), list):
         plays.extend(pbp_json["plays"])
 
@@ -128,60 +117,40 @@ def is_shot(text: str) -> bool:
             "hook shot",
             "putback",
             "alley-oop",
-            "floater",
-            "bank shot",
             "jump shot",
         ]
     )
 
 
-def shot_points(text: str) -> int:
-    """
-    Infer points from text.
-    - Free throw: 1
-    - Three point: 3
-    - Otherwise: 2
-    """
+def parse_shooter(text: str) -> str:
+    parts = re.split(r"\bmade\b|\bmissed\b|\bmakes\b|\bmisses\b", text, flags=re.IGNORECASE)
+    return (parts[0] if parts else "").strip().strip(".")
+
+
+def parse_distance_feet(text: str) -> Optional[int]:
+    m = re.search(r"(\d+)-foot", (text or "").lower())
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def shot_value(text: str) -> int:
     t = (text or "").lower()
     if "free throw" in t:
         return 1
     if "three point" in t or "three-point" in t:
         return 3
+    # sometimes ESPN uses distance but forgets "three point"
+    dist = parse_distance_feet(text)
+    if dist is not None and dist >= 23:
+        return 3
     return 2
 
 
-def parse_distance_feet(text: str) -> Optional[int]:
-    """
-    Many ESPN plays include: 'misses 24-foot three point jumper'
-    """
-    m = re.search(r"(\d+)-foot", (text or "").lower())
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    return None
-
-
-def parse_shooter(text: str) -> str:
-    parts = re.split(r"\bmade\b|\bmissed\b|\bmakes\b|\bmisses\b", text, flags=re.IGNORECASE)
-    shooter = (parts[0] if parts else "").strip().strip(".")
-    return shooter
-
-
 def infer_zone(text: str) -> str:
-    """
-    NBA-style zones (best-effort from text only; ESPN PBP often lacks true X/Y coords)
-    Zones:
-      - Restricted Area
-      - In The Paint (Non-RA)
-      - Mid-Range
-      - Left Corner 3
-      - Right Corner 3
-      - Above the Break 3
-      - Free Throw
-      - Other
-    """
     t = (text or "").lower()
 
     if "free throw" in t:
@@ -190,7 +159,6 @@ def infer_zone(text: str) -> str:
     is_three = ("three point" in t) or ("three-point" in t)
     dist = parse_distance_feet(text)
 
-    # Corner hints
     if is_three:
         if "left corner" in t:
             return "Left Corner 3"
@@ -198,15 +166,12 @@ def infer_zone(text: str) -> str:
             return "Right Corner 3"
         if "corner" in t:
             return "Corner 3"
-        # Many pbp use 22-foot (corner) / 23+ (above break) as rough proxy
         if dist is not None and dist <= 22:
             return "Corner 3"
         return "Above the Break 3"
 
-    # Rim / paint / midrange heuristics
-    rim_keywords = ["dunk", "layup", "tip-in", "putback", "alley-oop"]
-    if any(k in t for k in rim_keywords):
-        # if distance is provided, use it
+    rim_words = ["dunk", "layup", "tip-in", "putback", "alley-oop"]
+    if any(k in t for k in rim_words):
         if dist is not None:
             if dist <= 3:
                 return "Restricted Area"
@@ -215,12 +180,10 @@ def infer_zone(text: str) -> str:
             if dist <= 22:
                 return "Mid-Range"
             return "Other"
-        # no distance: treat as restricted/paint
-        if "driving" in t or "running" in t:
+        if "driving" in t:
             return "In The Paint (Non-RA)"
         return "Restricted Area"
 
-    # Jumpers/hook/floater often midrange unless distance says otherwise
     if dist is not None:
         if dist <= 3:
             return "Restricted Area"
@@ -228,23 +191,33 @@ def infer_zone(text: str) -> str:
             return "In The Paint (Non-RA)"
         if dist <= 22:
             return "Mid-Range"
-        # sometimes ESPN says 24-foot but omits "three point" keyword; treat as 3
         if dist >= 23:
             return "Above the Break 3"
         return "Other"
 
-    if any(k in t for k in ["jumper", "jump shot", "hook shot", "fadeaway", "turnaround", "floater"]):
+    if any(k in t for k in ["jumper", "hook shot", "fadeaway", "turnaround", "jump shot"]):
         return "Mid-Range"
 
     return "Other"
 
 
 def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
+    """
+    IMPORTANT: Always return a DF with the full schema, even when empty.
+    This prevents KeyError: 'shooter' downstream.
+    """
+    schema = [
+        "team", "period", "clock", "shooter", "result",
+        "zone", "shot_value", "pts", "description"
+    ]
+
     plays = extract_all_plays(pbp_json)
     rows = []
+
     for p in plays:
         if not isinstance(p, dict):
             continue
+
         text = (p.get("text") or "").strip()
         if not text or not is_shot(text):
             continue
@@ -253,7 +226,6 @@ def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
         if result == "":
             continue
 
-        shooter = parse_shooter(text)
         team = None
         if isinstance(p.get("team"), dict):
             team = p["team"].get("displayName") or p["team"].get("abbreviation")
@@ -266,9 +238,10 @@ def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
         if isinstance(p.get("period"), dict):
             period = p["period"].get("number")
 
+        shooter = parse_shooter(text)
+        val = shot_value(text)
         zone = infer_zone(text)
-        pts = shot_points(text)
-        made_flag = 1 if result == "Made" else 0
+        pts = val if result == "Made" else 0
 
         rows.append(
             {
@@ -278,59 +251,54 @@ def parse_shots(pbp_json: Dict[str, Any]) -> pd.DataFrame:
                 "shooter": shooter,
                 "result": result,
                 "zone": zone,
-                "pts": pts * made_flag,     # points scored on that event
-                "shot_value": pts,          # 1/2/3
+                "shot_value": val,
+                "pts": pts,
                 "description": text,
             }
         )
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # enforce schema even if empty
+    for c in schema:
+        if c not in df.columns:
+            df[c] = pd.Series(dtype="object")
+    return df[schema]
 
 
-def get_teams_from_summary(summary_json: Dict[str, Any]) -> List[str]:
-    teams = []
-    try:
-        comps = summary_json.get("header", {}).get("competitions", [])
-        if comps:
-            competitors = comps[0].get("competitors", [])
-            for c in competitors:
-                t = (c.get("team") or {}).get("displayName")
-                if t:
-                    teams.append(t)
-    except Exception:
-        pass
-    return teams
-
-
-def get_team_logos_from_summary(summary_json: Dict[str, Any]) -> Dict[str, str]:
+# -----------------------------
+# Headshots: Boxscore + Roster
+# -----------------------------
+def team_ids_and_logos(summary_json: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Map team displayName -> logo URL (best effort).
+    Returns:
+      team_name -> team_id
+      team_name -> logo_url
     """
-    out = {}
-    try:
-        comps = summary_json.get("header", {}).get("competitions", [])
-        if comps:
-            competitors = comps[0].get("competitors", [])
-            for c in competitors:
-                team_obj = c.get("team") or {}
-                name = team_obj.get("displayName")
-                logos = team_obj.get("logos") or []
-                logo = None
-                if isinstance(logos, list) and logos:
-                    # usually first logo has href
-                    if isinstance(logos[0], dict):
-                        logo = logos[0].get("href")
-                if name and logo:
-                    out[name] = logo
-    except Exception:
-        pass
-    return out
+    name_to_id = {}
+    name_to_logo = {}
+    comps = summary_json.get("header", {}).get("competitions", [])
+    if not comps:
+        return name_to_id, name_to_logo
+
+    competitors = comps[0].get("competitors", []) or []
+    for c in competitors:
+        team = c.get("team") or {}
+        name = team.get("displayName")
+        tid = team.get("id")
+        logos = team.get("logos") or []
+        logo = None
+        if isinstance(logos, list) and logos and isinstance(logos[0], dict):
+            logo = logos[0].get("href")
+
+        if name and tid:
+            name_to_id[name] = str(tid)
+        if name and logo:
+            name_to_logo[name] = logo
+
+    return name_to_id, name_to_logo
 
 
-def build_headshot_lookup(summary_json: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Build (team, player_norm) -> headshot_url from ESPN boxscore.
-    """
+def build_headshot_lookup_from_boxscore(summary_json: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     players_blocks = summary_json.get("boxscore", {}).get("players", [])
     if not isinstance(players_blocks, list):
@@ -338,7 +306,6 @@ def build_headshot_lookup(summary_json: Dict[str, Any]) -> pd.DataFrame:
 
     for team_block in players_blocks:
         team_name = (team_block.get("team") or {}).get("displayName") or (team_block.get("team") or {}).get("abbreviation")
-
         for stat_group in team_block.get("statistics", []) or []:
             for athlete_row in stat_group.get("athletes", []) or []:
                 athlete = (athlete_row or {}).get("athlete") or {}
@@ -353,13 +320,55 @@ def build_headshot_lookup(summary_json: Dict[str, Any]) -> pd.DataFrame:
                             "headshot_url": f"https://a.espncdn.com/i/headshots/mens-college-basketball/players/full/{aid}.png",
                         }
                     )
+    return pd.DataFrame(rows).drop_duplicates(subset=["team", "player_norm"])
 
-    df = pd.DataFrame(rows).drop_duplicates(subset=["team", "player_norm"])
-    return df
+
+def build_headshot_lookup_from_roster(team_name: str, roster_json: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    athletes = roster_json.get("athletes", []) or []
+    for a in athletes:
+        name = a.get("displayName") or a.get("fullName")
+        aid = a.get("id")
+        if name and aid:
+            rows.append(
+                {
+                    "team": team_name,
+                    "player": name,
+                    "player_norm": normalize_name(name),
+                    "headshot_url": f"https://a.espncdn.com/i/headshots/mens-college-basketball/players/full/{aid}.png",
+                }
+            )
+    return pd.DataFrame(rows).drop_duplicates(subset=["team", "player_norm"])
+
+
+def build_combined_headshot_lookup(summary_json: Dict[str, Any]) -> pd.DataFrame:
+    # Boxscore
+    box_df = build_headshot_lookup_from_boxscore(summary_json)
+
+    # Roster fallback for both teams in the game
+    team_id_map, _ = team_ids_and_logos(summary_json)
+    roster_frames = []
+    for team_name, tid in team_id_map.items():
+        try:
+            roster_json = fetch_team_roster(tid)
+            roster_frames.append(build_headshot_lookup_from_roster(team_name, roster_json))
+        except Exception:
+            pass
+
+    roster_df = pd.concat(roster_frames, ignore_index=True) if roster_frames else pd.DataFrame(
+        columns=["team", "player", "player_norm", "headshot_url"]
+    )
+
+    combined = pd.concat([box_df, roster_df], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["team", "player_norm"])
+    return combined
 
 
 def attach_headshots(shots: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
     shots = shots.copy()
+    if "shooter" not in shots.columns:
+        # ultra-safety
+        shots["shooter"] = ""
     shots["player_norm"] = shots["shooter"].map(normalize_name)
 
     merged = shots.merge(
@@ -368,7 +377,7 @@ def attach_headshots(shots: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
         how="left",
     )
 
-    # Optional fuzzy match if headshot missing (PBP name slightly different)
+    # Optional fuzzy matching if still missing
     if RAPIDFUZZ_AVAILABLE and not lookup.empty:
         missing = merged["headshot_url"].isna()
         if missing.any():
@@ -395,9 +404,9 @@ def attach_headshots(shots: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-# =========================
-# Aggregations (NBA-style table)
-# =========================
+# -----------------------------
+# Tables & styling
+# -----------------------------
 ZONE_ORDER = [
     "Restricted Area",
     "In The Paint (Non-RA)",
@@ -415,11 +424,11 @@ def zone_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["Zone", "FGM", "FGA", "PTS/shot", "FG%", "PTS", "Shot Share"])
 
-    df = df.copy()
-    df["FGA"] = 1
-    df["FGM"] = (df["result"] == "Made").astype(int)
+    x = df.copy()
+    x["FGA"] = 1
+    x["FGM"] = (x["result"] == "Made").astype(int)
 
-    g = df.groupby("zone", as_index=False).agg(
+    g = x.groupby("zone", as_index=False).agg(
         FGM=("FGM", "sum"),
         FGA=("FGA", "sum"),
         PTS=("pts", "sum"),
@@ -427,39 +436,29 @@ def zone_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     g["FG%"] = (g["FGM"] / g["FGA"]).fillna(0.0)
     g["PTS/shot"] = (g["PTS"] / g["FGA"]).fillna(0.0)
 
-    total_attempts = float(df["FGA"].sum())
-    g["Shot Share"] = (g["FGA"] / total_attempts).fillna(0.0) if total_attempts > 0 else 0.0
+    total = float(x["FGA"].sum())
+    g["Shot Share"] = (g["FGA"] / total).fillna(0.0) if total > 0 else 0.0
 
-    # Pretty formatting
     g.rename(columns={"zone": "Zone"}, inplace=True)
-
-    # Order
     g["__ord"] = g["Zone"].apply(lambda z: ZONE_ORDER.index(z) if z in ZONE_ORDER else 999)
     g = g.sort_values("__ord").drop(columns="__ord")
-
     return g
 
 
 def player_overview(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Team overview: each player totals
-    """
     if df.empty:
         return pd.DataFrame(columns=["Player", "FGM", "FGA", "FG%", "3PM", "3PA", "3P%", "FTM", "FTA", "FT%", "PTS"])
 
-    df = df.copy()
-    df["FGA"] = 1
-    df["FGM"] = (df["result"] == "Made").astype(int)
+    x = df.copy()
+    x["FGA"] = 1
+    x["FGM"] = (x["result"] == "Made").astype(int)
 
-    df["is_3"] = (df["shot_value"] == 3).astype(int)
-    df["3PA"] = df["is_3"]
-    df["3PM"] = df["is_3"] * df["FGM"]
+    x["3PA"] = (x["shot_value"] == 3).astype(int)
+    x["3PM"] = x["3PA"] * x["FGM"]
+    x["FTA"] = (x["shot_value"] == 1).astype(int)
+    x["FTM"] = x["FTA"] * x["FGM"]
 
-    df["is_ft"] = (df["shot_value"] == 1).astype(int)
-    df["FTA"] = df["is_ft"]
-    df["FTM"] = df["is_ft"] * df["FGM"]
-
-    g = df.groupby("shooter", as_index=False).agg(
+    g = x.groupby("shooter", as_index=False).agg(
         FGM=("FGM", "sum"),
         FGA=("FGA", "sum"),
         PTS=("pts", "sum"),
@@ -467,59 +466,29 @@ def player_overview(df: pd.DataFrame) -> pd.DataFrame:
         FTM=("FTM", "sum"),
         FTA=("FTA", "sum"),
     )
+
     g["FG%"] = (g["FGM"] / g["FGA"]).fillna(0.0)
     g["3P%"] = (g["3PM"] / g["3PA"]).replace([pd.NA, float("inf")], 0.0).fillna(0.0)
     g["FT%"] = (g["FTM"] / g["FTA"]).replace([pd.NA, float("inf")], 0.0).fillna(0.0)
 
     g.rename(columns={"shooter": "Player"}, inplace=True)
-    g = g.sort_values(["PTS", "FGA"], ascending=[False, False])
-    return g
+    return g.sort_values(["PTS", "FGA"], ascending=[False, False])
 
 
-def header_line(df_player: pd.DataFrame) -> Tuple[float, float, float, float]:
-    """
-    Return (PTS, FG%, 3P%, FT%) for the selected player in this single game.
-    """
-    if df_player.empty:
-        return 0.0, 0.0, 0.0, 0.0
-
-    df = df_player.copy()
-    df["FGA"] = 1
-    df["FGM"] = (df["result"] == "Made").astype(int)
-    pts = float(df["pts"].sum())
-    fg = float(df["FGM"].sum() / df["FGA"].sum()) if df["FGA"].sum() else 0.0
-
-    threes = df[df["shot_value"] == 3]
-    three_pct = float((threes["result"] == "Made").mean()) if len(threes) else 0.0
-
-    fts = df[df["shot_value"] == 1]
-    ft_pct = float((fts["result"] == "Made").mean()) if len(fts) else 0.0
-
-    return pts, fg, three_pct, ft_pct
-
-
-# =========================
-# Styling (FG% bands like screenshot)
-# =========================
 def fg_band_color(v: float) -> str:
-    """
-    Red < 0.30, Yellow 0.30-0.40, Green > 0.40
-    """
     try:
         x = float(v)
     except Exception:
         return ""
     if x < 0.30:
-        return "background-color: #f87171;"   # red-ish
+        return "background-color: #f87171;"
     if x <= 0.40:
-        return "background-color: #facc15;"   # yellow-ish
-    return "background-color: #4ade80;"       # green-ish
+        return "background-color: #facc15;"
+    return "background-color: #4ade80;"
 
 
-def style_zone_table(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
+def style_zone_table(df: pd.DataFrame):
     show = df.copy()
-
-    # Format columns to match NBA-style feel
     if "FG%" in show.columns:
         show["FG%"] = show["FG%"].round(3)
     if "PTS/shot" in show.columns:
@@ -530,152 +499,124 @@ def style_zone_table(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
     styler = show.style
     if "FG%" in show.columns:
         styler = styler.applymap(fg_band_color, subset=["FG%"])
-
     return styler
 
 
-# =========================
-# Streamlit UI (layout like your NBA app)
-# =========================
-st.set_page_config(page_title="College Basketball Shooting Dashboard", layout="wide")
+def header_line(df_player: pd.DataFrame) -> Tuple[int, float, float, float]:
+    if df_player.empty:
+        return 0, 0.0, 0.0, 0.0
 
-# Sidebar top refresh button
-colA, colB = st.columns([1, 8])
-with colA:
-    refresh = st.button("Refresh data now (pull latest)")
-with colB:
+    pts = int(df_player["pts"].sum())
+    fga = len(df_player)
+    fgm = int((df_player["result"] == "Made").sum())
+    fg = (fgm / fga) if fga else 0.0
+
+    threes = df_player[df_player["shot_value"] == 3]
+    three_pct = float((threes["result"] == "Made").mean()) if len(threes) else 0.0
+
+    fts = df_player[df_player["shot_value"] == 1]
+    ft_pct = float((fts["result"] == "Made").mean()) if len(fts) else 0.0
+
+    return pts, fg, three_pct, ft_pct
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="College Basketball Shooting — ESPN", layout="wide")
+
+top_left, top_right = st.columns([1.5, 8.5])
+with top_left:
+    refresh = st.button("Refresh data now\n(pull latest)")
+with top_right:
     st.markdown("")
 
-# Title (like your NBA app)
 st.title("College Basketball Shooting — ESPN Play-by-Play")
 
-# Sidebar controls
 with st.sidebar:
     st.header("Filters")
     game_input = st.text_input("Paste ESPN play-by-play URL or gameId:", value=DEFAULT_GAME_URL)
 
-    # Force refresh: clear cache
     if refresh:
         fetch_game_data.clear()
+        fetch_team_roster.clear()
 
-# Load data
-game_id = None
-data = None
-error = None
-try:
-    game_id = extract_game_id(game_input)
-    data = fetch_game_data(game_id)
-except Exception as e:
-    error = str(e)
-
-if error:
-    st.error(error)
-    st.stop()
+# Load game
+game_id = extract_game_id(game_input)
+data = fetch_game_data(game_id)
 
 summary_json = data["summary"]
 pbp_json = data["pbp"]
 
-# Build shot table + headshots
+# Parse
 shots = parse_shots(pbp_json)
-headshots = build_headshot_lookup(summary_json)
+
+plays_found = len(extract_all_plays(pbp_json))
+st.caption(f"Game ID: {game_id} | Plays found: {plays_found} | Shots parsed: {len(shots)}")
+
+# Headshots (boxscore + roster)
+headshots = build_combined_headshot_lookup(summary_json)
 shots = attach_headshots(shots, headshots)
 
-team_logos = get_team_logos_from_summary(summary_json)
-
-# If ESPN returns no shots (rare), show a helpful message
-if shots.empty:
-    st.warning("No shots parsed from ESPN play-by-play for this event.")
-    st.stop()
-
-# Build team list from shots (safer than header)
+# Teams list from shots
 teams = sorted([t for t in shots["team"].dropna().unique().tolist()])
+team_id_map, team_logo_map = team_ids_and_logos(summary_json)
 
 with st.sidebar:
     team_choice = st.selectbox("Choose a team:", options=["All"] + teams, index=0)
 
-# Filter by team
 shots_team = shots.copy()
 if team_choice != "All":
     shots_team = shots_team[shots_team["team"] == team_choice]
 
 players = sorted([p for p in shots_team["shooter"].dropna().unique().tolist()])
-
 with st.sidebar:
     player_choice = st.selectbox("Choose a player:", options=players, index=0 if players else 0)
 
-# Filter by player
 shots_player = shots_team[shots_team["shooter"] == player_choice].copy()
 
-# Header row like your NBA app: photo + logo + name + quick stats line
+# Header (player headshot + team logo + stats line)
 left, mid, right = st.columns([1.2, 1.2, 6.6])
 
-# Player headshot
 with left:
     hs = None
-    # pick first non-null
-    if "headshot_url" in shots_player.columns:
-        vals = shots_player["headshot_url"].dropna().unique().tolist()
-        hs = vals[0] if vals else None
+    vals = shots_player["headshot_url"].dropna().unique().tolist() if not shots_player.empty else []
+    hs = vals[0] if vals else None
     if isinstance(hs, str) and hs.startswith("http"):
         st.image(hs, width=120)
 
-# Team logo (if available)
 with mid:
-    logo_url = None
-    if team_choice != "All":
-        logo_url = team_logos.get(team_choice)
-    else:
-        # just show nothing if All
-        logo_url = None
+    logo_url = team_logo_map.get(team_choice) if team_choice != "All" else None
     if isinstance(logo_url, str) and logo_url.startswith("http"):
         st.image(logo_url, width=110)
 
-# Text header
 with right:
-    # Figure out opponent label from header if available
     st.subheader(f"{player_choice} — Single Game Shooting Profile")
     pts, fg, three_pct, ft_pct = header_line(shots_player)
-
-    # Create a clean line similar to your NBA app
-    st.caption(
-        f"PTS: {pts:.0f}  |  FG%: {fg*100:.1f}%  |  3P%: {three_pct*100:.1f}%  |  FT%: {ft_pct*100:.1f}%"
-    )
+    st.caption(f"PTS: {pts}  |  FG%: {fg*100:.1f}%  |  3P%: {three_pct*100:.1f}%  |  FT%: {ft_pct*100:.1f}%")
     st.caption("FG% color bands: Red < 30%, Yellow 30–40%, Green > 40%")
 
 st.divider()
 
-# Tabs like your NBA app
 tab1, tab2 = st.tabs(["Zone breakdown", "Team overview"])
 
 with tab1:
-    zb = zone_breakdown(shots_player)
-
-    # add a clean index column like your screenshot
-    zb = zb.reset_index(drop=True)
+    zb = zone_breakdown(shots_player).reset_index(drop=True)
     zb.insert(0, "", zb.index)
-
-    st.dataframe(
-        style_zone_table(zb),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(style_zone_table(zb), use_container_width=True, hide_index=True)
 
 with tab2:
-    # Team overview table (all players)
     to = player_overview(shots_team).reset_index(drop=True)
     to.insert(0, "", to.index)
 
-    # Make percent columns pretty
     for c in ["FG%", "3P%", "FT%"]:
         if c in to.columns:
             to[c] = (to[c] * 100).round(1)
 
     st.dataframe(to, use_container_width=True, hide_index=True)
 
-    # Optional: show shot log underneath
     with st.expander("Show shot log (play-by-play shots)"):
-        show_cols = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
+        show_cols = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description", "headshot_url"]
         st.dataframe(shots_team[show_cols], use_container_width=True, hide_index=True)
 
-# Footer note like your NBA app
-st.caption("Auto-updates every 5 min (or press Refresh). ESPN play-by-play is text-based; zone locations are inferred from descriptions.")
+st.caption("Auto-updates every 5 min (or press Refresh). ESPN play-by-play is text-based; zones are inferred from descriptions.")
