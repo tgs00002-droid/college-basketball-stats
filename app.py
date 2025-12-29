@@ -12,9 +12,6 @@ except Exception:
     RAPIDFUZZ_AVAILABLE = False
 
 
-# -----------------------------
-# Config
-# -----------------------------
 USER_AGENT = "Mozilla/5.0"
 CACHE_TTL_SECONDS = 300
 
@@ -23,9 +20,6 @@ MARYLAND_TEAM_ID = "120"
 MARYLAND_NAME_DEFAULT = "Maryland Terrapins"
 
 
-# -----------------------------
-# HTTP helpers
-# -----------------------------
 def safe_get(url: str) -> requests.Response:
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
     r.raise_for_status()
@@ -43,7 +37,6 @@ def extract_game_id(url_or_id: str) -> str:
     m = re.search(r"gameId/(\d+)", s)
     if m:
         return m.group(1)
-    # also allow /gameId=#### in query
     m2 = re.search(r"gameId=(\d+)", s)
     if m2:
         return m2.group(1)
@@ -77,15 +70,11 @@ def fetch_pbp_html_tables(game_id: str) -> List[pd.DataFrame]:
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def fetch_team_schedule(team_id: str) -> Dict[str, Any]:
-    # Team schedule endpoint
     return safe_get_json(
         f"https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams/{team_id}/schedule"
     )
 
 
-# -----------------------------
-# Parsing
-# -----------------------------
 def normalize_name(name: str) -> str:
     if not isinstance(name, str):
         return ""
@@ -93,6 +82,25 @@ def normalize_name(name: str) -> str:
     name = re.sub(r"[^a-z\s\-']", "", name)
     name = re.sub(r"\s+", " ", name)
     return name
+
+
+def keep_only_team(shots_df: pd.DataFrame, team_name: str) -> pd.DataFrame:
+    if shots_df is None or shots_df.empty:
+        return shots_df
+    tn = (team_name or "").strip().lower()
+    if not tn:
+        return shots_df
+
+    s = shots_df.copy()
+    s["team_norm"] = s["team"].astype(str).str.lower().str.strip()
+
+    mask = s["team_norm"].str.contains(re.escape(tn), na=False)
+
+    if not mask.any() and "maryland" in tn:
+        mask = s["team_norm"].str.contains("maryland", na=False)
+
+    s = s.loc[mask].drop(columns=["team_norm"])
+    return s
 
 
 def parse_result(text: str) -> str:
@@ -296,7 +304,6 @@ def parse_shots_from_html_tables(summary_json: Dict[str, Any], tables: List[pd.D
         df = t.copy()
         df.columns = cols
 
-        # find clock col
         clock_col = None
         for c in cols:
             if "time" in c or "clock" in c:
@@ -352,9 +359,6 @@ def parse_shots_from_html_tables(summary_json: Dict[str, Any], tables: List[pd.D
     return df_out[schema]
 
 
-# -----------------------------
-# Headshots (roster)
-# -----------------------------
 def build_roster_headshots(team_id: str) -> pd.DataFrame:
     roster_json = fetch_team_roster(team_id)
     rows = []
@@ -403,16 +407,18 @@ def attach_headshots(shots: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-# -----------------------------
-# Schedule -> list of games
-# -----------------------------
+def score_value(x):
+    if isinstance(x, dict):
+        return x.get("displayValue") or x.get("value")
+    return x
+
+
 def parse_schedule(schedule_json: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     events = schedule_json.get("events", []) or []
     for e in events:
         eid = e.get("id")
         date = e.get("date")
-        name = e.get("name")  # "Maryland Terrapins vs Virginia Cavaliers"
         comp = (e.get("competitions") or [{}])[0]
         competitors = comp.get("competitors", []) or []
 
@@ -423,12 +429,11 @@ def parse_schedule(schedule_json: Dict[str, Any]) -> pd.DataFrame:
             ha = (c.get("homeAway") or "").lower()
             if ha == "home":
                 home = t.get("displayName", "")
-                home_score = c.get("score")
+                home_score = score_value(c.get("score"))
             elif ha == "away":
                 away = t.get("displayName", "")
-                away_score = c.get("score")
+                away_score = score_value(c.get("score"))
 
-        # Determine opponent and home/away for Maryland
         if home and "Maryland" in home:
             home_away = "Home"
             opponent = away
@@ -439,13 +444,11 @@ def parse_schedule(schedule_json: Dict[str, Any]) -> pd.DataFrame:
             home_away = ""
             opponent = ""
 
-        # status / outcome
-        status = ((e.get("status") or {}).get("type") or {}).get("name") or ""
         outcome = ""
         try:
             hs = int(home_score) if home_score is not None else None
             a_s = int(away_score) if away_score is not None else None
-            if hs is not None and a_s is not None:
+            if hs is not None and a_s is not None and home_away:
                 maryland_score = hs if home_away == "Home" else a_s
                 opp_score = a_s if home_away == "Home" else hs
                 if maryland_score > opp_score:
@@ -459,31 +462,20 @@ def parse_schedule(schedule_json: Dict[str, Any]) -> pd.DataFrame:
             {
                 "game_id": str(eid) if eid else None,
                 "date": date,
+                "date_short": str(pd.to_datetime(date, errors="coerce").date()) if date else "",
                 "opponent": opponent,
                 "home_away": home_away,
-                "status": status,
                 "outcome": outcome,
-                "home": home,
-                "away": away,
                 "home_score": home_score,
                 "away_score": away_score,
-                "name": name,
             }
         )
 
     df = pd.DataFrame(rows).dropna(subset=["game_id"])
-    # nicer date display
-    if "date" in df.columns:
-        df["date_short"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
-    else:
-        df["date_short"] = ""
     return df
 
 
 def fetch_and_parse_shots_for_game(game_id: str) -> Tuple[pd.DataFrame, str, int]:
-    """
-    Returns: (shots_df, source_used, api_plays_found)
-    """
     data = fetch_game_data(game_id)
     summary_json = data["summary"]
     pbp_json = data["pbp"]
@@ -507,16 +499,9 @@ def fetch_and_parse_shots_for_game(game_id: str) -> Tuple[pd.DataFrame, str, int
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
-def build_season_shots(team_id: str, max_games: int = 50) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-      shots_all (stacked shots across games)
-      schedule_df (parsed schedule)
-    """
+def build_maryland_season_shots(team_id: str, team_name: str, max_games: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     schedule_json = fetch_team_schedule(team_id)
     sched = parse_schedule(schedule_json)
-
-    # Only keep games that have an id (most do). Limit to max_games to avoid long runs.
     sched_use = sched.head(max_games).copy()
 
     all_frames = []
@@ -526,11 +511,17 @@ def build_season_shots(team_id: str, max_games: int = 50) -> Tuple[pd.DataFrame,
         if shots_df is None or shots_df.empty:
             continue
 
+        # ✅ Maryland-only
+        shots_df = keep_only_team(shots_df, team_name)
+        if shots_df is None or shots_df.empty:
+            continue
+
         shots_df = shots_df.copy()
         shots_df["game_id"] = gid
         shots_df["date"] = r.get("date_short", "")
         shots_df["opponent"] = r.get("opponent", "")
         shots_df["home_away"] = r.get("home_away", "")
+        shots_df["outcome"] = r.get("outcome", "")
         shots_df["source_used"] = source_used
         shots_df["api_plays_found"] = api_plays_found
         all_frames.append(shots_df)
@@ -539,9 +530,6 @@ def build_season_shots(team_id: str, max_games: int = 50) -> Tuple[pd.DataFrame,
     return shots_all, sched
 
 
-# -----------------------------
-# Summary tables
-# -----------------------------
 ZONE_ORDER = [
     "Restricted Area",
     "In The Paint (Non-RA)",
@@ -611,211 +599,120 @@ def style_zone_table(df: pd.DataFrame):
 def header_line(df_player: pd.DataFrame) -> Tuple[int, float, float, float]:
     if df_player is None or df_player.empty:
         return 0, 0.0, 0.0, 0.0
-
     pts = int(df_player["pts"].sum())
     fga = len(df_player)
     fgm = int((df_player["result"] == "Made").sum())
     fg = (fgm / fga) if fga else 0.0
-
     threes = df_player[df_player["shot_value"] == 3]
     three_pct = float((threes["result"] == "Made").mean()) if len(threes) else 0.0
-
     fts = df_player[df_player["shot_value"] == 1]
     ft_pct = float((fts["result"] == "Made").mean()) if len(fts) else 0.0
-
     return pts, fg, three_pct, ft_pct
 
 
-# -----------------------------
-# UI
-# -----------------------------
 st.set_page_config(page_title="Maryland Shooting — ESPN", layout="wide")
 
-top_left, _ = st.columns([1.8, 8.2])
-with top_left:
-    refresh = st.button("Refresh data now\n(pull latest)")
+refresh = st.button("Refresh data now (pull latest)")
 
-st.title("College Basketball Shooting — ESPN Play-by-Play")
+st.title("College Basketball Shooting — ESPN Play-by-Play (Maryland Only)")
 
 with st.sidebar:
-    st.header("Filters")
-
-    mode = st.radio("Mode", ["Maryland season (aggregate)", "Single game"], index=0)
-
-    st.subheader("Roster (headshots)")
+    st.header("Roster (headshots)")
     roster_team_id = st.text_input("Roster teamId (Maryland = 120)", value=MARYLAND_TEAM_ID)
     roster_team_name = st.text_input("Roster team name", value=MARYLAND_NAME_DEFAULT)
-
-    if mode == "Single game":
-        game_input = st.text_input("Paste ESPN play-by-play URL or gameId:", value=DEFAULT_GAME_URL)
-    else:
-        max_games = st.slider("How many schedule games to include", min_value=5, max_value=40, value=25, step=1)
+    max_games = st.slider("How many schedule games to include", min_value=5, max_value=40, value=25, step=1)
 
     if refresh:
         fetch_game_data.clear()
         fetch_team_roster.clear()
         fetch_pbp_html_tables.clear()
         fetch_team_schedule.clear()
-        build_season_shots.clear()
+        build_maryland_season_shots.clear()
 
-# Headshots lookup (used both modes)
 roster_lookup = build_roster_headshots(roster_team_id.strip())
 
-# -----------------------------
-# Mode: Season aggregate
-# -----------------------------
-if mode == "Maryland season (aggregate)":
-    with st.spinner("Loading Maryland schedule and aggregating shots across games..."):
-        shots_all, sched = build_season_shots(roster_team_id.strip(), max_games=max_games)
+with st.spinner("Loading Maryland schedule and aggregating Maryland shots across games..."):
+    shots_all, sched = build_maryland_season_shots(roster_team_id.strip(), roster_team_name.strip(), max_games=max_games)
 
-    # Sidebar schedule display (simple)
-    st.sidebar.subheader("Maryland schedule (from ESPN)")
-    if sched is not None and not sched.empty:
-        show_sched = sched[["date_short", "opponent", "home_away", "outcome", "home_score", "away_score"]].copy()
-        show_sched.rename(
-            columns={
-                "date_short": "Date",
-                "opponent": "Opponent",
-                "home_away": "H/A",
-                "outcome": "W/L",
-                "home_score": "Home",
-                "away_score": "Away",
-            },
-            inplace=True,
-        )
-        st.sidebar.dataframe(show_sched, use_container_width=True, height=320, hide_index=True)
-
-    if shots_all is None or shots_all.empty:
-        st.warning("No shots parsed from the season games pulled. Try increasing max games or click Refresh.")
-        st.stop()
-
-    # Attach headshots
-    shots_all = attach_headshots(shots_all, roster_lookup)
-
-    # Filters
-    with st.sidebar:
-        st.subheader("Season filters")
-        game_opts = ["All"] + sorted(shots_all["game_id"].unique().tolist())
-        game_pick = st.selectbox("Game", options=game_opts, index=0)
-
-        opp_opts = ["All"] + sorted([x for x in shots_all["opponent"].dropna().unique().tolist() if str(x).strip()])
-        opp_pick = st.selectbox("Opponent", options=opp_opts, index=0)
-
-        zone_opts = ["All"] + sorted(shots_all["zone"].dropna().unique().tolist())
-        zone_pick = st.selectbox("Zone", options=zone_opts, index=0)
-
-        res_opts = ["All", "Made", "Missed"]
-        res_pick = st.selectbox("Result", options=res_opts, index=0)
-
-        player_opts = sorted(shots_all["shooter"].dropna().unique().tolist())
-        player_pick = st.selectbox("Player", options=player_opts, index=0 if player_opts else 0)
-
-    filt = shots_all.copy()
-    if game_pick != "All":
-        filt = filt[filt["game_id"] == game_pick]
-    if opp_pick != "All":
-        filt = filt[filt["opponent"] == opp_pick]
-    if zone_pick != "All":
-        filt = filt[filt["zone"] == zone_pick]
-    if res_pick != "All":
-        filt = filt[filt["result"] == res_pick]
-
-    player_df = filt[filt["shooter"] == player_pick].copy()
-
-    st.caption(
-        f"Season shots: {len(shots_all)} | Filtered shots: {len(filt)} | Player shots: {len(player_df)}"
+st.sidebar.subheader("Maryland schedule (from ESPN)")
+if sched is not None and not sched.empty:
+    show_sched = sched[["date_short", "opponent", "home_away", "outcome", "home_score", "away_score"]].copy()
+    show_sched.rename(
+        columns={"date_short": "Date", "opponent": "Opponent", "home_away": "H/A", "outcome": "W/L",
+                 "home_score": "MD", "away_score": "Opp"},
+        inplace=True,
     )
+    st.sidebar.dataframe(show_sched, use_container_width=True, height=320, hide_index=True)
 
-    # Header
-    left, right = st.columns([1.5, 8.5])
-    with left:
-        vals = player_df["headshot_url"].dropna().unique().tolist() if "headshot_url" in player_df.columns else []
-        hs = vals[0] if vals else None
-        if isinstance(hs, str) and hs.startswith("http"):
-            st.image(hs, width=120)
-    with right:
-        st.subheader(f"{player_pick} — Season Shooting Profile (Aggregated)")
-        pts, fg, three_pct, ft_pct = header_line(player_df)
-        st.caption(f"PTS: {pts}  |  FG%: {fg*100:.1f}%  |  3P%: {three_pct*100:.1f}%  |  FT%: {ft_pct*100:.1f}%")
-        st.caption("FG% color bands: Red < 30%, Yellow 30–40%, Green > 40%")
+if shots_all is None or shots_all.empty:
+    st.warning("No Maryland shots parsed from the selected schedule games. Try increasing games or click Refresh.")
+    st.stop()
 
-    st.divider()
+shots_all = attach_headshots(shots_all, roster_lookup)
 
-    tab1, tab2, tab3 = st.tabs(["Zone breakdown", "Shot log", "Download"])
-    with tab1:
-        zb = zone_breakdown(player_df).reset_index(drop=True)
-        zb.insert(0, "", zb.index)
-        st.dataframe(style_zone_table(zb), use_container_width=True, hide_index=True)
+with st.sidebar:
+    st.subheader("Season filters (Maryland only)")
+    game_opts = ["All"] + sorted(shots_all["game_id"].unique().tolist())
+    game_pick = st.selectbox("Game", options=game_opts, index=0)
 
-    with tab2:
-        cols = ["date", "opponent", "home_away", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
-        if "headshot_url" in player_df.columns:
-            cols.append("headshot_url")
-        st.dataframe(player_df[cols], use_container_width=True, hide_index=True)
+    opp_opts = ["All"] + sorted([x for x in shots_all["opponent"].dropna().unique().tolist() if str(x).strip()])
+    opp_pick = st.selectbox("Opponent", options=opp_opts, index=0)
 
-    with tab3:
-        csv1 = filt.to_csv(index=False).encode("utf-8")
-        st.download_button("Download filtered season shots CSV", data=csv1, file_name="maryland_season_shots_filtered.csv")
+    zone_opts = ["All"] + sorted(shots_all["zone"].dropna().unique().tolist())
+    zone_pick = st.selectbox("Zone", options=zone_opts, index=0)
 
-        csv2 = shots_all.to_csv(index=False).encode("utf-8")
-        st.download_button("Download full season shots CSV", data=csv2, file_name="maryland_season_shots_full.csv")
+    res_pick = st.selectbox("Result", options=["All", "Made", "Missed"], index=0)
 
-    st.caption("Season mode pulls Maryland schedule from ESPN and aggregates shots across games. Zones inferred from text.")
+    player_opts = sorted(shots_all["shooter"].dropna().unique().tolist())
+    player_pick = st.selectbox("Player", options=player_opts, index=0 if player_opts else 0)
 
-# -----------------------------
-# Mode: Single game (your original)
-# -----------------------------
-else:
-    game_id = extract_game_id(game_input)
-    shots, source_used, api_plays_found = fetch_and_parse_shots_for_game(game_id)
+filt = shots_all.copy()
+if game_pick != "All":
+    filt = filt[filt["game_id"] == game_pick]
+if opp_pick != "All":
+    filt = filt[filt["opponent"] == opp_pick]
+if zone_pick != "All":
+    filt = filt[filt["zone"] == zone_pick]
+if res_pick != "All":
+    filt = filt[filt["result"] == res_pick]
 
-    st.caption(f"Game ID: {game_id} | API plays found: {api_plays_found} | Shots parsed: {len(shots)} | Source: {source_used}")
+player_df = filt[filt["shooter"] == player_pick].copy()
 
-    if shots is None or shots.empty:
-        st.warning("No shots parsed for this game. Try another gameId or click Refresh.")
-        st.stop()
+st.caption(f"Season shots (Maryland only): {len(shots_all)} | Filtered shots: {len(filt)} | Player shots: {len(player_df)}")
 
-    shots = attach_headshots(shots, roster_lookup)
+left, right = st.columns([1.5, 8.5])
+with left:
+    vals = player_df["headshot_url"].dropna().unique().tolist() if "headshot_url" in player_df.columns else []
+    hs = vals[0] if vals else None
+    if isinstance(hs, str) and hs.startswith("http"):
+        st.image(hs, width=120)
 
-    teams = sorted([t for t in shots["team"].dropna().unique().tolist()])
-    with st.sidebar:
-        team_choice = st.selectbox("Choose a team:", options=["All"] + teams, index=0)
+with right:
+    st.subheader(f"{player_pick} — Season Shooting Profile (Maryland Only)")
+    pts, fg, three_pct, ft_pct = header_line(player_df)
+    st.caption(f"PTS: {pts}  |  FG%: {fg*100:.1f}%  |  3P%: {three_pct*100:.1f}%  |  FT%: {ft_pct*100:.1f}%")
+    st.caption("FG% color bands: Red < 30%, Yellow 30–40%, Green > 40%")
 
-    shots_team = shots.copy()
-    if team_choice != "All":
-        shots_team = shots_team[shots_team["team"] == team_choice]
+st.divider()
 
-    players = sorted([p for p in shots_team["shooter"].dropna().unique().tolist()])
-    with st.sidebar:
-        player_choice = st.selectbox("Choose a player:", options=players, index=0 if players else 0)
+tab1, tab2, tab3 = st.tabs(["Zone breakdown", "Shot log", "Download"])
+with tab1:
+    zb = zone_breakdown(player_df).reset_index(drop=True)
+    zb.insert(0, "", zb.index)
+    st.dataframe(style_zone_table(zb), use_container_width=True, hide_index=True)
 
-    shots_player = shots_team[shots_team["shooter"] == player_choice].copy()
+with tab2:
+    cols = ["date", "opponent", "home_away", "outcome", "period", "clock", "shooter",
+            "result", "zone", "shot_value", "pts", "description"]
+    if "headshot_url" in player_df.columns:
+        cols.append("headshot_url")
+    st.dataframe(player_df[cols], use_container_width=True, hide_index=True)
 
-    left, right = st.columns([1.5, 8.5])
-    with left:
-        vals = shots_player["headshot_url"].dropna().unique().tolist() if "headshot_url" in shots_player.columns else []
-        hs = vals[0] if vals else None
-        if isinstance(hs, str) and hs.startswith("http"):
-            st.image(hs, width=120)
+with tab3:
+    csv1 = filt.to_csv(index=False).encode("utf-8")
+    st.download_button("Download filtered Maryland shots CSV", data=csv1, file_name="maryland_shots_filtered.csv")
 
-    with right:
-        st.subheader(f"{player_choice} — Single Game Shooting Profile")
-        pts, fg, three_pct, ft_pct = header_line(shots_player)
-        st.caption(f"PTS: {pts}  |  FG%: {fg*100:.1f}%  |  3P%: {three_pct*100:.1f}%  |  FT%: {ft_pct*100:.1f}%")
-        st.caption("FG% color bands: Red < 30%, Yellow 30–40%, Green > 40%")
+    csv2 = shots_all.to_csv(index=False).encode("utf-8")
+    st.download_button("Download full Maryland shots CSV", data=csv2, file_name="maryland_shots_full.csv")
 
-    st.divider()
-
-    tab1, tab2 = st.tabs(["Zone breakdown", "Shot log"])
-    with tab1:
-        zb = zone_breakdown(shots_player).reset_index(drop=True)
-        zb.insert(0, "", zb.index)
-        st.dataframe(style_zone_table(zb), use_container_width=True, hide_index=True)
-
-    with tab2:
-        show_cols = ["team", "period", "clock", "shooter", "result", "zone", "shot_value", "pts", "description"]
-        if "headshot_url" in shots_team.columns:
-            show_cols.append("headshot_url")
-        st.dataframe(shots_team[show_cols], use_container_width=True, hide_index=True)
-
-    st.caption("Single-game mode uses ESPN API first, then HTML fallback. Zones inferred from text.")
+st.caption("This dashboard is Maryland-only: it filters every game to Maryland shots before aggregating.")
